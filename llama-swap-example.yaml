@@ -28,6 +28,17 @@ models:
       responseHeader: 0
       tlsHandshake: 0
       idleConn: 0
+    filters:
+      setParams: 
+        temperature: 1.0
+        top_p: 0.95
+        min_p: 0.05
+        chat_template_kwargs:
+          enable_thinking: true
+          reasoning_effort: "enabled"
+        enable_thinking: true
+        reasoning_effort: "enabled"
+
 
 healthCheckTimeout: 999999
 

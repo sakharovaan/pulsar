@@ -1,3 +1,11 @@
+# Notes on fork
+
+This fork is tested and optimized for a specific configuration:
+* 96 Gb VRAM RTX 6000 (single) + 128 Gb RAM
+* Minimax M3
+
+It fixes main issues I've encountered
+
 # Pulsar
 
 ![pulsar](docs/assets/pulsar-poster.png)

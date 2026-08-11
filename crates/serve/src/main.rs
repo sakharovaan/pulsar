@@ -1314,6 +1314,10 @@ fn encode_messages_jinja(
             "reasoning_effort".into(),
             serde_json::Value::String(e.into()),
         );
+        extra.insert(
+            "thinking_mode".into(),
+            serde_json::Value::String(e.into()),
+        );
     }
     let extra_v = if extra.is_empty() {
         None
@@ -1847,6 +1851,9 @@ fn handle_chat(
                         }
                     } else if open_think && d.as_slice() == b"</think>" {
                         reasoning = false; // close: the reply starts here
+                    } else if open_think && d.as_slice() == b"</mm:think>" {
+                        reasoning = false; // close: the reply starts here (Minimax tag)
+                    
                     } else if open_think && reasoning {
                         rbytes.extend_from_slice(&d);
                     } else if !FENCE.contains(&d.as_slice()) {

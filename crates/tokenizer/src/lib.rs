@@ -277,7 +277,7 @@ impl ChatMarkers {
                 aux0: find("<mm:think>")?,
                 aux1: find("</mm:think>")?,
                 stops: t.stop_ids.clone(),
-                think: false,
+                think: true,
                 reasoning: "medium",
             });
         }
@@ -470,14 +470,14 @@ impl ChatMarkers {
     /// the last PROMPT token, never a generated one — a consumer that waits
     /// for an opening tag would route the whole reply to reasoning.
     pub fn opens_thinking(&self) -> bool {
-        matches!(self.style, ChatStyle::Glm | ChatStyle::Laguna) && self.think
+        matches!(self.style, ChatStyle::Glm | ChatStyle::Laguna | ChatStyle::MiniMax ) && self.think
     }
 
     /// Whether this style has a reasoning mode a caller can steer.
     pub fn reasoning_capable(&self) -> bool {
         matches!(
             self.style,
-            ChatStyle::Glm | ChatStyle::Harmony | ChatStyle::Laguna
+            ChatStyle::Glm | ChatStyle::Harmony | ChatStyle::Laguna | ChatStyle::MiniMax
         )
     }
 
