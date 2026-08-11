@@ -9,7 +9,6 @@ models:
       - "PULSAR_CPU_STEAL=1"
       - "PULSAR_KV=q8"
       - "PULSAR_CACHE_GB=80"
-      - "PULSAR_ALLOWED_HOSTS=192.168.88.69:5800"
       #- "PULSAR_H2D_PREFETCH=true"
       - "PULSAR_CPU_VERIFY=true"
       - "PULSAR_SPLIT=off"
