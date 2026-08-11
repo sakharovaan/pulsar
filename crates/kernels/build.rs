@@ -52,9 +52,9 @@ fn main() {
         // lowest arch also embeds its PTX (universal JIT floor); highest
         // embeds its PTX too (best ISA for future GPUs); middles are SASS-only
         let code = if first || last {
-            format!("arch=compute_{a},code=[sm_{a},compute_{a}]")
+            format!("arch=compute_{a},code=[sm_{a}a,compute_{a}]")
         } else {
-            format!("arch=compute_{a},code=sm_{a}")
+            format!("arch=compute_{a},code=sm_{a}a")
         };
         build.flag("-gencode").flag(&code);
     }

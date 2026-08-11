@@ -1,0 +1,36 @@
+models:
+  minimax-M3-q4:
+    aliases:
+      - "minimax-main-current"
+    env:
+      - "PULSAR_MTP=1"
+      - "PULSAR_CPU=64"
+      - "PULSAR_CPU_CAP=99999"
+      - "PULSAR_CPU_STEAL=1"
+      - "PULSAR_KV=q8"
+      - "PULSAR_CACHE_GB=80"
+      - "PULSAR_ALLOWED_HOSTS=192.168.88.69:5800"
+      #- "PULSAR_H2D_PREFETCH=true"
+      - "PULSAR_CPU_VERIFY=true"
+      - "PULSAR_SPLIT=off"
+      - "PULSAR_CUDA_ARCH=120"
+      - "PULSAR_CPU_B=1024"
+      - "PULSAR_PROFILE=1"
+      - "PULSAR_BATCH=6000"
+      - "PULSAR_ATTN_GPU=0"
+      - "PULSAR_ATTN_HOST=0"
+      - "PULSAR_TIERS=off"
+    checkEndpoint: "/"
+    cmd: "/apps/pulsar/target/release/pulsar-serve -m /apps/models/m9e/MiniMax-M3-uncensored-RP-LC-Q4HQ-GGUF/MiniMax-M3-uncensored-RP-LC-Q4HQ-00001-of-00018.gguf --port ${PORT} --host 0.0.0.0 --ctx 85536 --jinja-chat"
+    proxy: "http://127.0.0.1:${PORT}"
+    timeouts:
+      connect: 0
+      keepalive: 0
+      responseHeader: 0
+      tlsHandshake: 0
+      idleConn: 0
+
+healthCheckTimeout: 999999
+
+performance:
+  disabled: false
