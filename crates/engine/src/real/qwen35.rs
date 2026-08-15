@@ -34,7 +34,7 @@ fn matw(out: &mut DeviceBuf, w: &MatW, x: &DeviceBuf, xq: &DeviceBuf, in_dim: u3
 const T_MAX: usize = 16;
 /// DFlash feature-ring capacity = the draft context window (lucebox
 /// defaults to 2048; v1 keeps the fc cost down with 256).
-const RING_CAP: usize = 256;
+pub(super) const RING_CAP: usize = 256;
 
 fn argmax(row: &[f32]) -> u32 {
     let mut best = 0usize;
@@ -146,6 +146,7 @@ struct DenseBank {
     small: DeviceBuf,
     g: DeviceBuf,
     beta: DeviceBuf,
+    gb: DeviceBuf,
     gdn_o: DeviceBuf,
     gdn_tmp: DeviceBuf,
     qfull: DeviceBuf,
@@ -195,6 +196,7 @@ impl DenseBank {
             gk: f32s(T_MAX * key_dim)?,
             gv: f32s(T_MAX * value_dim)?,
             small: f32s(T_MAX * s.ssm_v_heads as usize)?,
+            gb: f32s(2 * s.ssm_v_heads as usize)?,
             g: f32s(T_MAX * s.ssm_v_heads as usize)?,
             beta: f32s(T_MAX * s.ssm_v_heads as usize)?,
             gdn_o: f32s(T_MAX * value_dim)?,
@@ -240,6 +242,62 @@ impl DenseBank {
     }
 }
 
+/// FFN tensor-parallel scratch on card B (PULSAR_TP): the quantized
+/// activation bounces into xq, the half-width chain runs there while
+/// the primary runs its own half, and out carries B's partial down
+/// output back through recv (allocated on the PRIMARY) for the add.
+/// T_MAX rows like every other qwen35 scratch.
+struct TpBank {
+    dev: i32,
+    xq: DeviceBuf,
+    gate: DeviceBuf,
+    up: DeviceBuf,
+    mid: DeviceBuf,
+    midq: DeviceBuf,
+    out: DeviceBuf,
+    recv: DeviceBuf,
+    /// GDN half (phase 3): B receives the layer-normed residual, derives
+    /// its own quantized copy, and runs a complete half-GDN over its
+    /// heads with its own recurrent states
+    normed: DeviceBuf,
+    qkv: DeviceBuf,
+    conv_out: DeviceBuf,
+    z: DeviceBuf,
+    gq: DeviceBuf,
+    gk: DeviceBuf,
+    gv: DeviceBuf,
+    g: DeviceBuf,
+    beta: DeviceBuf,
+    gb: DeviceBuf,
+    gdn_o: DeviceBuf,
+    gdn_tmp: DeviceBuf,
+    states: Vec<Option<GdnState>>,
+    /// attention half (phase 3b): B's fused q|gate, split q/gate, k/v,
+    /// and gated heads over its 12 q / 2 kv heads
+    aqf: DeviceBuf,
+    aq: DeviceBuf,
+    agate: DeviceBuf,
+    ak: DeviceBuf,
+    av: DeviceBuf,
+    aheads: DeviceBuf,
+    /// per-token position cells the graph-captured attention kernels
+    /// dereference; one per card (no P2P, a device word is only
+    /// readable on its own card)
+    pos_a: DeviceBuf,
+    pos_b: DeviceBuf,
+    /// vocab-split head: B's half-logits and its (value, index) argmax
+    /// pairs (8 B a row back instead of half a megabyte)
+    hlog: DeviceBuf,
+    bmax: DeviceBuf,
+    /// A->B activation handoff and B->A partial return. Reusing xq and
+    /// recv across layers is race-free: each link's event forms a
+    /// cross-stream back-edge every layer (A's next xq overwrite sits
+    /// behind the add that gated on lo; B's next recv overwrite gates
+    /// on lx behind A's next quantize).
+    lx: kernels::TpLink,
+    lo: kernels::TpLink,
+}
+
 /// qwen35 runtime: GDN states + scratch sized for T_MAX-token chunks.
 pub(super) struct Qwen35Rt {
     states: Vec<Option<GdnState>>,
@@ -253,6 +311,8 @@ pub(super) struct Qwen35Rt {
     /// disables.
     graphs: std::collections::HashMap<(u32, usize), kernels::Graph>,
     graphs_on: bool,
+    /// FFN tensor-parallel scratch on the second card (PULSAR_TP)
+    tpb: Option<TpBank>,
     qkv: DeviceBuf,      // [T][conv_dim] raw projection
     conv_out: DeviceBuf, // [T][conv_dim] conv+silu, layout [q|k|v] per row
     z: DeviceBuf,        // [T][value_dim]
@@ -260,6 +320,9 @@ pub(super) struct Qwen35Rt {
     gk: DeviceBuf,       // [T][key_dim]
     gv: DeviceBuf,       // [T][value_dim]
     small: DeviceBuf,    // [T][ssm_v_heads] alpha/beta matvec scratch
+    /// packed [g | beta] row for the concatenated coefficient matmul
+    /// (decode fast path)
+    gb: DeviceBuf,
     g: DeviceBuf,        // [T][ssm_v_heads] log-decay upload
     beta: DeviceBuf,     // [T][ssm_v_heads]
     gdn_o: DeviceBuf,    // [T][value_dim]
@@ -306,10 +369,92 @@ impl Qwen35Rt {
         let f32s = |n: usize| DeviceBuf::alloc(n * 4);
         let graphs_on = std::env::var("PULSAR_GRAPHS").ok().as_deref() != Some("0")
             && m.layers.iter().any(|l| matches!(l.ffn, super::Ffn::DenseKq { .. }));
+        let tpb = match &m.tp {
+            Some(tp) => {
+                let q8k = |n: usize| {
+                    n.div_ceil(kernels::Q8_K_BLOCK_ELEMS) * kernels::Q8_K_BLOCK_BYTES
+                };
+                let half = tp.half as usize;
+                let (kdh, vdh) = (key_dim / 2, value_dim / 2);
+                let cdh = 2 * kdh + vdh;
+                let vh = s.ssm_v_heads as usize / 2;
+                let recv = f32s(T_MAX * s.n_embd as usize)?; // on the primary
+                // an event records only on its OWN device's streams: lx
+                // records on A (the activation sends: q8_K rows for the
+                // FFN, f32 normed for the GDN half), lo on B (the
+                // partial returns), so each is created with that device
+                // current
+                let lx = kernels::TpLink::new(T_MAX * s.n_embd as usize * 4)?;
+                kernels::set_device(tp.dev)?;
+                let mut bstates = Vec::with_capacity(s.n_exec_layer as usize);
+                for il in 0..s.n_exec_layer as usize {
+                    if m.tp_gdn(il).is_some() {
+                        let sbytes = vh * s.ssm_state as usize * s.ssm_state as usize * 4;
+                        let cbytes = (s.ssm_conv_k as usize - 1) * cdh * 4;
+                        let mut st2 = GdnState {
+                            s: DeviceBuf::alloc(sbytes)?,
+                            conv: DeviceBuf::alloc(cbytes)?,
+                            dev: tp.dev,
+                            snap_s: None,
+                            snap_conv: None,
+                        };
+                        kernels::zero(&mut st2.s, sbytes)?;
+                        kernels::zero(&mut st2.conv, cbytes)?;
+                        bstates.push(Some(st2));
+                    } else {
+                        bstates.push(None);
+                    }
+                }
+                let b = TpBank {
+                    dev: tp.dev,
+                    xq: DeviceBuf::alloc(T_MAX * q8k(s.n_embd as usize))?,
+                    gate: f32s(T_MAX * half)?,
+                    up: f32s(T_MAX * half)?,
+                    mid: f32s(T_MAX * half)?,
+                    midq: DeviceBuf::alloc(T_MAX * q8k(half))?,
+                    out: f32s(T_MAX * s.n_embd as usize)?,
+                    recv,
+                    normed: f32s(T_MAX * s.n_embd as usize)?,
+                    qkv: f32s(T_MAX * cdh)?,
+                    conv_out: f32s(T_MAX * cdh)?,
+                    z: f32s(T_MAX * vdh)?,
+                    gq: f32s(T_MAX * kdh)?,
+                    gk: f32s(T_MAX * kdh)?,
+                    gv: f32s(T_MAX * vdh)?,
+                    g: f32s(T_MAX * vh)?,
+                    beta: f32s(T_MAX * vh)?,
+                    gb: f32s(2 * vh)?,
+                    gdn_o: f32s(T_MAX * vdh)?,
+                    gdn_tmp: f32s(T_MAX * vdh)?,
+                    states: bstates,
+                    aqf: f32s(T_MAX * (s.n_head * s.head_dim) as usize)?,
+                    aq: f32s(T_MAX * (s.n_head / 2 * s.head_dim) as usize)?,
+                    agate: f32s(T_MAX * (s.n_head / 2 * s.head_dim) as usize)?,
+                    ak: f32s(T_MAX * (s.n_head_kv / 2 * s.head_dim) as usize)?,
+                    av: f32s(T_MAX * (s.n_head_kv / 2 * s.head_dim) as usize)?,
+                    aheads: f32s(T_MAX * (s.n_head / 2 * s.head_dim) as usize)?,
+                    pos_b: DeviceBuf::alloc(4)?,
+                    hlog: f32s(16 * (s.n_vocab / 2) as usize)?,
+                    bmax: DeviceBuf::alloc(16 * 8)?,
+                    pos_a: {
+                        kernels::set_device(primary)?;
+                        let b = DeviceBuf::alloc(4)?;
+                        kernels::set_device(tp.dev)?;
+                        b
+                    },
+                    lx,
+                    lo: kernels::TpLink::new(T_MAX * s.n_embd as usize * 4)?,
+                };
+                kernels::set_device(primary)?;
+                Some(b)
+            }
+            None => None,
+        };
         Ok(Qwen35Rt {
             bank,
             graphs: std::collections::HashMap::new(),
             graphs_on,
+            tpb,
             states,
             qkv: f32s(T_MAX * conv_dim)?,
             conv_out: f32s(T_MAX * conv_dim)?,
@@ -318,6 +463,7 @@ impl Qwen35Rt {
             gk: f32s(T_MAX * key_dim)?,
             gv: f32s(T_MAX * value_dim)?,
             small: f32s(T_MAX * s.ssm_v_heads as usize)?,
+            gb: f32s(2 * s.ssm_v_heads as usize)?,
             g: f32s(T_MAX * s.ssm_v_heads as usize)?,
             beta: f32s(T_MAX * s.ssm_v_heads as usize)?,
             gdn_o: f32s(T_MAX * value_dim)?,
@@ -333,7 +479,8 @@ impl Qwen35Rt {
     /// beside their state, so the copies never cross cards).
     pub(super) fn gdn_snapshot(&mut self) -> Result {
         let primary = kernels::get_device();
-        for gs in self.states.iter_mut().flatten() {
+        let tpb_states = self.tpb.iter_mut().flat_map(|b| b.states.iter_mut());
+        for gs in self.states.iter_mut().chain(tpb_states).flatten() {
             kernels::set_device(gs.dev)?;
             if gs.snap_s.is_none() {
                 gs.snap_s = Some(DeviceBuf::alloc(gs.s.bytes())?);
@@ -351,7 +498,8 @@ impl Qwen35Rt {
     /// Restore the last gdn_snapshot (partial MTP acceptance).
     pub(super) fn gdn_restore(&mut self) -> Result {
         let primary = kernels::get_device();
-        for gs in self.states.iter_mut().flatten() {
+        let tpb_states = self.tpb.iter_mut().flat_map(|b| b.states.iter_mut());
+        for gs in self.states.iter_mut().chain(tpb_states).flatten() {
             let (Some(ss), Some(sc)) = (&gs.snap_s, &gs.snap_conv) else {
                 return Err("gdn_restore without a snapshot".into());
             };
@@ -370,7 +518,8 @@ impl Qwen35Rt {
     pub(super) fn ckpt(&self) -> Result<Vec<Option<(DeviceBuf, DeviceBuf)>>> {
         let primary = kernels::get_device();
         let mut out = Vec::with_capacity(self.states.len());
-        for gs in &self.states {
+        let tpb_states = self.tpb.iter().flat_map(|b| b.states.iter());
+        for gs in self.states.iter().chain(tpb_states) {
             out.push(match gs {
                 Some(g) => {
                     kernels::set_device(g.dev)?;
@@ -389,7 +538,8 @@ impl Qwen35Rt {
 
     pub(super) fn ckpt_restore(&mut self, ck: &[Option<(DeviceBuf, DeviceBuf)>]) -> Result {
         let primary = kernels::get_device();
-        for (gs, c) in self.states.iter_mut().zip(ck) {
+        let tpb_states = self.tpb.iter_mut().flat_map(|b| b.states.iter_mut());
+        for (gs, c) in self.states.iter_mut().chain(tpb_states).zip(ck) {
             if let (Some(g), Some((s2, c2))) = (gs, c) {
                 kernels::set_device(g.dev)?;
                 kernels::copy_d2d(&mut g.s, 0, s2, 0, s2.bytes())?;
@@ -402,7 +552,8 @@ impl Qwen35Rt {
 
     fn reset(&mut self) -> Result {
         let primary = kernels::get_device();
-        for st in self.states.iter_mut().flatten() {
+        let tpb_states = self.tpb.iter_mut().flat_map(|b| b.states.iter_mut());
+        for st in self.states.iter_mut().chain(tpb_states).flatten() {
             kernels::set_device(st.dev)?;
             let (sb, cb) = (st.s.bytes(), st.conv.bytes());
             kernels::zero(&mut st.s, sb)?;
@@ -415,6 +566,11 @@ impl Qwen35Rt {
     fn enable_dflash(&mut self, m: &Model, layer_ids: Vec<usize>) -> Result {
         if self.dflash.is_some() {
             return Ok(());
+        }
+        if m.tp.is_some() {
+            // the fast-rollback stash and capture ring assume full-width
+            // qkv rows on one card
+            return Err("PULSAR_DFLASH with PULSAR_TP is not supported yet".into());
         }
         let s = m.shape;
         let feat_w = layer_ids.len() * s.n_embd as usize;
@@ -842,7 +998,7 @@ impl DraftModel {
 /// Confidence cut threshold in logit space. PULSAR_DSPARK_CONF is the
 /// sigmoid probability (default 0.5: cut only slots the head thinks are
 /// more likely rejected than accepted); "off" disables the cut.
-fn dspark_conf_threshold() -> f32 {
+pub(super) fn dspark_conf_threshold() -> f32 {
     match std::env::var("PULSAR_DSPARK_CONF").ok().as_deref() {
         Some("off") => f32::NEG_INFINITY,
         Some(v) => v
@@ -890,6 +1046,16 @@ impl Model {
             let t = chunk.len() as u32;
             let ids: Vec<i32> = chunk.iter().map(|&x| x as i32).collect();
             st.tok.write(0, kernels::as_bytes(&ids))?;
+            // per-token position cells (TP graph capture): the captured
+            // attention kernels dereference these, so a replayed graph
+            // sees the fresh position. Written OUTSIDE any capture, one
+            // async 1-thread launch per card.
+            if let Some(tb) = rt.tpb.as_mut() {
+                kernels::set_u32(&mut tb.pos_a, pos)?;
+                kernels::set_device(tb.dev)?;
+                kernels::set_u32(&mut tb.pos_b, pos)?;
+                kernels::set_device(primary)?;
+            }
             kernels::embed_q8_0(&mut st.cur, &self.token_embd, &st.tok, s.n_embd, s.n_vocab, t)?;
             self.eval_qwen35_span(st, rt, 0, n0, pos, t)?;
             if let Some(b) = &mut bank {
@@ -949,6 +1115,43 @@ impl Model {
         let row = s.n_embd as usize * 4;
         kernels::copy_d2d(&mut st.last_row, 0, &st.cur, (last_t - k) as usize * row, k as usize * row)?;
         kernels::rms_norm(&mut st.normed, &st.last_row, &self.output_norm, s.n_embd, k, s.rms_eps)?;
+        if st.skip_logit_read {
+            // argmax-only rows: the head is the biggest serial card-A
+            // item (2.06ms/token, nsys), and these paths never need the
+            // logits themselves - so under TP each card computes its
+            // vocab half and argmaxes it in place, 8 bytes a row back
+            // per card, merged host-side exactly like one full scan
+            // (strict > keeps the full scan's first-index tie rule).
+            let split = self.tp.as_ref().and_then(|tp| tp.head.as_ref()).and_then(|hb| {
+                self.output_kq.map(|(rb, q)| (hb, rb, q))
+            });
+            if let (Some((hb, row_bytes, quant)), Some(tb)) = (split, rt.tpb.as_mut()) {
+                let v2 = s.n_vocab / 2;
+                tb.lx.send(&st.normed, (k * s.n_embd) as usize * 4)?;
+                kernels::set_device(tb.dev)?;
+                tb.lx.recv(&mut tb.normed, (k * s.n_embd) as usize * 4)?;
+                kernels::quantize_q8_k(&mut tb.xq, &tb.normed, s.n_embd, k)?;
+                kernels::matmul_kq(&mut tb.hlog, &hb.w, &tb.xq, s.n_embd, v2, k, hb.row_bytes, hb.quant)?;
+                kernels::argmax_rows_launch(&mut tb.bmax, &tb.hlog, v2, k)?;
+                kernels::set_device(kernels::primary_device())?;
+                kernels::quantize_q8_k(&mut st.head_xq, &st.normed, s.n_embd, k)?;
+                kernels::matmul_kq(&mut st.logits, &self.output, &st.head_xq, s.n_embd, v2, k, row_bytes, quant)?;
+                kernels::argmax_rows_launch(&mut st.amax_out, &st.logits, v2, k)?;
+                let ap = kernels::argmax_pairs_read(&st.amax_out, k)?;
+                kernels::set_device(tb.dev)?;
+                let bp = kernels::argmax_pairs_read(&tb.bmax, k)?;
+                kernels::set_device(kernels::primary_device())?;
+                st.last_argmax = ap
+                    .iter()
+                    .zip(&bp)
+                    .map(|(a, b)| if b.0 > a.0 { b.1 + v2 } else { a.1 })
+                    .collect();
+                return Ok(Some(Vec::new()));
+            }
+            self.head_logits(st, k)?;
+            st.last_argmax = kernels::argmax_rows(&mut st.amax_out, &st.logits, s.n_vocab, k)?;
+            return Ok(Some(Vec::new()));
+        }
         self.head_logits(st, k)?;
         kernels::sync()?;
         Ok(Some(st.logits.read_f32(k as usize * s.n_vocab as usize)?))
@@ -966,11 +1169,23 @@ impl Model {
         // and the capture_gdn stash is a runtime branch with cudaMemcpy -
         // illegal under stream capture, silently skipped on replay
         let dflash_on = rt.dflash.is_some();
+        // attention layers join the graphs under TP when the position
+        // can be read from the device cells (f32 KV, below the split-K
+        // threshold): Arc 1 of the 60-tok/s plan
+        let attn_ok = self.tp.is_some() && st.ctx <= 4096 && st.kvq == 0;
         let graphable = |il: usize| {
             let l = &self.layers[il];
+            // TP spans capture too (phase 4): TpLink runs on the
+            // per-thread default streams and the event edges join card
+            // B's stream into the capture DAG, so the whole dual-card
+            // GDN+FFN chain replays as one multi-device graph
             !dflash_on
-                && matches!(&l.attn, Attn::Qwen35(w) if w.gdn.is_some())
                 && matches!(l.ffn, Ffn::DenseKq { .. })
+                && match &l.attn {
+                    Attn::Qwen35(w) if w.gdn.is_some() => true,
+                    Attn::Qwen35(w) if w.attn.is_some() => attn_ok && self.tp_attn(il).is_some(),
+                    _ => false,
+                }
         };
         let mut graphs = std::mem::take(&mut rt.graphs);
         let mut il = lo;
@@ -999,7 +1214,24 @@ impl Model {
                         if let Some(e) = inner {
                             return Err(e);
                         }
-                        e.insert(g?);
+                        match g {
+                            Ok(g) => {
+                                e.insert(g);
+                            }
+                            Err(err) => {
+                                // a capture refusal (driver/topology
+                                // specifics, e.g. cross-device nodes) is
+                                // a lost optimization, not an error: run
+                                // plain from here on
+                                eprintln!("pulsar: graph capture failed ({err}); running without graphs");
+                                rt.graphs_on = false;
+                                for j in lo2..hi2 {
+                                    self.eval_qwen35_layer(st, rt, j, &self.layers[j], pos, t)?;
+                                }
+                                il = end;
+                                continue;
+                            }
+                        }
                     }
                     graphs[&key].launch()?;
                     il = end;
@@ -1059,6 +1291,98 @@ impl Model {
         }
 
         if let Some(gdn) = &w.gdn {
+            if let (Some(bw), Some(tb)) = (self.tp_gdn(il), rt.tpb.as_mut()) {
+                // ---- GDN tensor parallel: ship the normed residual to
+                // card B, which quantizes its own copy and runs a full
+                // half-GDN over its heads (delta-rule state is head-
+                // local); ssm_out is row-parallel so B returns a full-
+                // width partial that adds into A's. Same TpLink pipeline
+                // as the FFN: zero host syncs.
+                let vh = s.ssm_v_heads / 2;
+                let kh = s.ssm_k_heads / 2;
+                let kdh = kh * s.ssm_state;
+                let vdh = vh * s.ssm_state;
+                let cdh = 2 * kdh + vdh;
+                kernels::quantize_q8_k(&mut st.xq, &st.normed, s.n_embd, t)?;
+                tb.lx.send(&st.normed, (t * s.n_embd) as usize * 4)?;
+                kernels::set_device(tb.dev)?;
+                tb.lx.recv(&mut tb.normed, (t * s.n_embd) as usize * 4)?;
+                if matches!(bw.wqkv, MatW::Kq(_)) {
+                    kernels::quantize_q8_k(&mut tb.xq, &tb.normed, s.n_embd, t)?;
+                }
+                matw(&mut tb.qkv, &bw.wqkv, &tb.normed, &tb.xq, s.n_embd, cdh, t)?;
+                matw(&mut tb.z, &bw.wz, &tb.normed, &tb.xq, s.n_embd, vdh, t)?;
+                let packed = t == 1;
+                if packed {
+                    // ONE [n_embd -> 2vh] matmul feeds both coefficient
+                    // sets; the packed row is g[0..vh] ++ beta[vh..2vh]
+                    kernels::matmul_f32(&mut tb.gb, &bw.ab_w, &tb.normed, s.n_embd, 2 * vh, 1)?;
+                    kernels::qwen35_gdn_coeffs_packed(&mut tb.gb, vh as usize * 4, &bw.a, &bw.dt_bias, vh)?;
+                } else {
+                    kernels::matmul_f32(&mut tb.g, &bw.ab_w, &tb.normed, s.n_embd, vh, t)?;
+                    kernels::matmul_f32_off(&mut tb.beta, &bw.ab_w, vh as usize * s.n_embd as usize * 4, &tb.normed, s.n_embd, vh, t)?;
+                    kernels::qwen35_gdn_coeffs(&mut tb.g, &mut tb.beta, &bw.a, &bw.dt_bias, t, vh)?;
+                }
+                let bs = tb.states[il].as_mut().ok_or("tp gdn state missing")?;
+                kernels::qwen35_conv_batch(&mut tb.conv_out, &tb.qkv, &bw.conv, &mut bs.conv, cdh, s.ssm_conv_k, t)?;
+                kernels::qwen35_split_qkv(&mut tb.gq, &mut tb.gk, &mut tb.gv, &tb.conv_out, t, kdh, vdh)?;
+                kernels::qwen35_l2_norm(&mut tb.gq, t * kh, s.ssm_state, eps)?;
+                kernels::qwen35_l2_norm(&mut tb.gk, t * kh, s.ssm_state, eps)?;
+                if packed {
+                    kernels::qwen35_gdn_batch_packed(
+                        &mut tb.gdn_o, &mut bs.s, &tb.gq, &tb.gk, &tb.gv, &tb.gb, vh as usize * 4,
+                        vh, kh, s.ssm_state,
+                    )?;
+                } else {
+                    kernels::qwen35_gdn_batch(
+                        &mut tb.gdn_o, &mut bs.s, &tb.gq, &tb.gk, &tb.gv, &tb.g, &tb.beta,
+                        vh, kh, s.ssm_state, t,
+                    )?;
+                }
+                kernels::gqa_head_rms_norm(&mut tb.gdn_o, Some(&bw.ssm_norm), t * vh, s.ssm_state, eps)?;
+                kernels::swiglu(&mut tb.gdn_tmp, &tb.z, &tb.gdn_o, t * vdh, 0.0, 1.0, 0)?;
+                if matches!(bw.ssm_out, MatW::Kq(_)) {
+                    kernels::quantize_q8_k(&mut tb.midq, &tb.gdn_tmp, vdh, t)?;
+                }
+                matw(&mut tb.out, &bw.ssm_out, &tb.gdn_tmp, &tb.midq, vdh, s.n_embd, t)?;
+                tb.lo.send(&tb.out, (t * s.n_embd) as usize * 4)?;
+                kernels::set_device(kernels::primary_device())?;
+                // A's half, overlapping with B's chain
+                matw(&mut rt.qkv, &gdn.wqkv, &st.normed, &st.xq, s.n_embd, cdh, t)?;
+                matw(&mut rt.z, &gdn.wz, &st.normed, &st.xq, s.n_embd, vdh, t)?;
+                if packed {
+                    kernels::matmul_f32(&mut rt.gb, &gdn.ab_w, &st.normed, s.n_embd, 2 * vh, 1)?;
+                    kernels::qwen35_gdn_coeffs_packed(&mut rt.gb, vh as usize * 4, &gdn.a, &gdn.dt_bias, vh)?;
+                } else {
+                    kernels::matmul_f32(&mut rt.g, &gdn.ab_w, &st.normed, s.n_embd, vh, t)?;
+                    kernels::matmul_f32_off(&mut rt.beta, &gdn.ab_w, vh as usize * s.n_embd as usize * 4, &st.normed, s.n_embd, vh, t)?;
+                    kernels::qwen35_gdn_coeffs(&mut rt.g, &mut rt.beta, &gdn.a, &gdn.dt_bias, t, vh)?;
+                }
+                let gs = rt.states[il].as_mut().ok_or("gdn state missing")?;
+                kernels::qwen35_conv_batch(&mut rt.conv_out, &rt.qkv, &gdn.conv, &mut gs.conv, cdh, s.ssm_conv_k, t)?;
+                kernels::qwen35_split_qkv(&mut rt.gq, &mut rt.gk, &mut rt.gv, &rt.conv_out, t, kdh, vdh)?;
+                kernels::qwen35_l2_norm(&mut rt.gq, t * kh, s.ssm_state, eps)?;
+                kernels::qwen35_l2_norm(&mut rt.gk, t * kh, s.ssm_state, eps)?;
+                if packed {
+                    kernels::qwen35_gdn_batch_packed(
+                        &mut rt.gdn_o, &mut gs.s, &rt.gq, &rt.gk, &rt.gv, &rt.gb, vh as usize * 4,
+                        vh, kh, s.ssm_state,
+                    )?;
+                } else {
+                    kernels::qwen35_gdn_batch(
+                        &mut rt.gdn_o, &mut gs.s, &rt.gq, &rt.gk, &rt.gv, &rt.g, &rt.beta,
+                        vh, kh, s.ssm_state, t,
+                    )?;
+                }
+                kernels::gqa_head_rms_norm(&mut rt.gdn_o, Some(&gdn.ssm_norm), t * vh, s.ssm_state, eps)?;
+                kernels::swiglu(&mut rt.gdn_tmp, &rt.z, &rt.gdn_o, t * vdh, 0.0, 1.0, 0)?;
+                if matches!(gdn.ssm_out, MatW::Kq(_)) {
+                    kernels::quantize_q8_k(&mut st.midq, &rt.gdn_tmp, vdh, t)?;
+                }
+                matw(&mut st.attn_out, &gdn.ssm_out, &rt.gdn_tmp, &st.midq, vdh, s.n_embd, t)?;
+                tb.lo.recv(&mut tb.recv, (t * s.n_embd) as usize * 4)?;
+                kernels::add_assign(&mut st.attn_out, &tb.recv, t * s.n_embd)?;
+            } else {
             // ---- Gated DeltaNet (recurrences loop inside the launches)
             if matches!(gdn.wqkv, MatW::Kq(_)) {
                 kernels::quantize_q8_k(&mut st.xq, &st.normed, s.n_embd, t)?;
@@ -1069,8 +1393,8 @@ impl Model {
                 eprintln!("  qkv {:?} z {:?}", rt.qkv.read_f32(2)?, rt.z.read_f32(2)?);
             }
             // g/beta coefficients fully on-device (no host readbacks)
-            kernels::matmul_f32(&mut rt.g, &gdn.alpha_w, &st.normed, s.n_embd, s.ssm_v_heads, t)?;
-            kernels::matmul_f32(&mut rt.beta, &gdn.beta_w, &st.normed, s.n_embd, s.ssm_v_heads, t)?;
+            kernels::matmul_f32(&mut rt.g, &gdn.ab_w, &st.normed, s.n_embd, s.ssm_v_heads, t)?;
+            kernels::matmul_f32_off(&mut rt.beta, &gdn.ab_w, s.ssm_v_heads as usize * s.n_embd as usize * 4, &st.normed, s.n_embd, s.ssm_v_heads, t)?;
             kernels::qwen35_gdn_coeffs(&mut rt.g, &mut rt.beta, &gdn.a, &gdn.dt_bias, t, s.ssm_v_heads)?;
 
             // fast-rollback stash: the raw qkv rows + final coeffs are
@@ -1108,9 +1432,100 @@ impl Model {
                 kernels::quantize_q8_k(&mut st.midq, &rt.gdn_tmp, value_dim, t)?;
             }
             matw(&mut st.attn_out, &gdn.ssm_out, &rt.gdn_tmp, &st.midq, value_dim, s.n_embd, t)?;
+            }
         } else if let Some(attn) = &w.attn {
-            // ---- sigmoid-gated full attention (partial neox rope)
             let hd = s.head_dim;
+            if let (Some(bw), Some(tb)) = (self.tp_attn(il), rt.tpb.as_mut()) {
+                // ---- attention tensor parallel: 12/12 q heads, 2/2 kv
+                // heads, each card owns its heads' KV cache; the output
+                // projection is row-parallel so B returns a full-width
+                // partial. GQA grouping survives the split (6 q per kv
+                // head on both cards). Same TpLink pipeline, zero host
+                // syncs. Turbo KV is gated off at load under TP.
+                let nh2 = s.n_head / 2;
+                let nkv2 = s.n_head_kv / 2;
+                kernels::quantize_q8_k(&mut st.xq, &st.normed, s.n_embd, t)?;
+                tb.lx.send(&st.normed, (t * s.n_embd) as usize * 4)?;
+                kernels::set_device(tb.dev)?;
+                tb.lx.recv(&mut tb.normed, (t * s.n_embd) as usize * 4)?;
+                if matches!(bw.wq, MatW::Kq(_)) {
+                    kernels::quantize_q8_k(&mut tb.xq, &tb.normed, s.n_embd, t)?;
+                }
+                matw(&mut tb.aqf, &bw.wq, &tb.normed, &tb.xq, s.n_embd, 2 * nh2 * hd, t)?;
+                kernels::qwen35_split_gate(&mut tb.aq, &mut tb.agate, &tb.aqf, t * nh2, hd)?;
+                matw(&mut tb.ak, &bw.wk, &tb.normed, &tb.xq, s.n_embd, nkv2 * hd, t)?;
+                matw(&mut tb.av, &bw.wv, &tb.normed, &tb.xq, s.n_embd, nkv2 * hd, t)?;
+                kernels::gqa_head_rms_norm(&mut tb.aq, Some(&bw.q_norm), t * nh2, hd, eps)?;
+                kernels::gqa_head_rms_norm(&mut tb.ak, Some(&bw.k_norm), t * nkv2, hd, eps)?;
+                let dev_pos = st.ctx <= 4096 && st.kvq == 0;
+                let (bk, bv) = st.tp_kcache[il].as_mut().ok_or("tp attn cache missing")?;
+                if dev_pos {
+                    kernels::gqa_rope_dev(&mut tb.aq, t, nh2, hd, s.rot_dim, &tb.pos_b, s.rope_freq_base)?;
+                    kernels::gqa_rope_dev(&mut tb.ak, t, nkv2, hd, s.rot_dim, &tb.pos_b, s.rope_freq_base)?;
+                    kernels::gqa_kv_append_dev(bk, &tb.ak, t, nkv2, hd, st.ctx, &tb.pos_b)?;
+                    kernels::gqa_kv_append_dev(bv, &tb.av, t, nkv2, hd, st.ctx, &tb.pos_b)?;
+                    kernels::gqa_attention_dev(
+                        &mut tb.aheads, &tb.aq, bk, bv,
+                        t, nh2, nkv2, hd, st.ctx, &tb.pos_b,
+                        1.0 / (hd as f32).sqrt(),
+                    )?;
+                } else {
+                    kernels::gqa_rope(&mut tb.aq, t, nh2, hd, s.rot_dim, pos, s.rope_freq_base, None)?;
+                    kernels::gqa_rope(&mut tb.ak, t, nkv2, hd, s.rot_dim, pos, s.rope_freq_base, None)?;
+                    kernels::gqa_kv_append(bk, &tb.ak, t, nkv2, hd, st.ctx, pos, st.kvq)?;
+                    kernels::gqa_kv_append(bv, &tb.av, t, nkv2, hd, st.ctx, pos, st.kvq)?;
+                    kernels::gqa_attention_rel(
+                        &mut tb.aheads, &tb.aq, bk, bv,
+                        t, nh2, nkv2, hd, st.ctx, pos,
+                        1.0 / (hd as f32).sqrt(), 0, None, 0, st.kvq,
+                        None,
+                    )?;
+                }
+                kernels::qwen35_sigmoid_gate(&mut tb.aheads, &tb.agate, t * nh2 * hd)?;
+                if matches!(bw.out, MatW::Kq(_)) {
+                    kernels::quantize_q8_k(&mut tb.midq, &tb.aheads, nh2 * hd, t)?;
+                }
+                matw(&mut tb.out, &bw.out, &tb.aheads, &tb.midq, nh2 * hd, s.n_embd, t)?;
+                tb.lo.send(&tb.out, (t * s.n_embd) as usize * 4)?;
+                kernels::set_device(kernels::primary_device())?;
+                // A's heads, overlapping with B's chain
+                matw(&mut rt.qfull, &attn.wq, &st.normed, &st.xq, s.n_embd, 2 * nh2 * hd, t)?;
+                kernels::qwen35_split_gate(&mut st.q, &mut rt.gate, &rt.qfull, t * nh2, hd)?;
+                matw(&mut st.k, &attn.wk, &st.normed, &st.xq, s.n_embd, nkv2 * hd, t)?;
+                matw(&mut st.v, &attn.wv, &st.normed, &st.xq, s.n_embd, nkv2 * hd, t)?;
+                kernels::gqa_head_rms_norm(&mut st.q, Some(&attn.q_norm), t * nh2, hd, eps)?;
+                kernels::gqa_head_rms_norm(&mut st.k, Some(&attn.k_norm), t * nkv2, hd, eps)?;
+                if dev_pos {
+                    kernels::gqa_rope_dev(&mut st.q, t, nh2, hd, s.rot_dim, &tb.pos_a, s.rope_freq_base)?;
+                    kernels::gqa_rope_dev(&mut st.k, t, nkv2, hd, s.rot_dim, &tb.pos_a, s.rope_freq_base)?;
+                    kernels::gqa_kv_append_dev(&mut st.kcache[il], &st.k, t, nkv2, hd, st.ctx, &tb.pos_a)?;
+                    kernels::gqa_kv_append_dev(&mut st.vcache[il], &st.v, t, nkv2, hd, st.ctx, &tb.pos_a)?;
+                    kernels::gqa_attention_dev(
+                        &mut st.heads, &st.q, &st.kcache[il], &st.vcache[il],
+                        t, nh2, nkv2, hd, st.ctx, &tb.pos_a,
+                        1.0 / (hd as f32).sqrt(),
+                    )?;
+                } else {
+                    kernels::gqa_rope(&mut st.q, t, nh2, hd, s.rot_dim, pos, s.rope_freq_base, None)?;
+                    kernels::gqa_rope(&mut st.k, t, nkv2, hd, s.rot_dim, pos, s.rope_freq_base, None)?;
+                    kernels::gqa_kv_append(&mut st.kcache[il], &st.k, t, nkv2, hd, st.ctx, pos, st.kvq)?;
+                    kernels::gqa_kv_append(&mut st.vcache[il], &st.v, t, nkv2, hd, st.ctx, pos, st.kvq)?;
+                    kernels::gqa_attention_rel(
+                        &mut st.heads, &st.q, &st.kcache[il], &st.vcache[il],
+                        t, nh2, nkv2, hd, st.ctx, pos,
+                        1.0 / (hd as f32).sqrt(), 0, None, 0, st.kvq,
+                        None,
+                    )?;
+                }
+                kernels::qwen35_sigmoid_gate(&mut st.heads, &rt.gate, t * nh2 * hd)?;
+                if matches!(attn.out, MatW::Kq(_)) {
+                    kernels::quantize_q8_k(&mut st.midq, &st.heads, nh2 * hd, t)?;
+                }
+                matw(&mut st.attn_out, &attn.out, &st.heads, &st.midq, nh2 * hd, s.n_embd, t)?;
+                tb.lo.recv(&mut tb.recv, (t * s.n_embd) as usize * 4)?;
+                kernels::add_assign(&mut st.attn_out, &tb.recv, t * s.n_embd)?;
+            } else {
+            // ---- sigmoid-gated full attention (partial neox rope)
             if matches!(attn.wq, MatW::Kq(_)) {
                 kernels::quantize_q8_k(&mut st.xq, &st.normed, s.n_embd, t)?;
             }
@@ -1157,6 +1572,7 @@ impl Model {
                 kernels::quantize_q8_k(&mut st.midq, &st.heads, s.n_head * hd, t)?;
             }
             matw(&mut st.attn_out, &attn.out, &st.heads, &st.midq, s.n_head * hd, s.n_embd, t)?;
+            }
         } else {
             return Err("qwen35 layer with neither attn nor gdn".into());
         }
@@ -1175,6 +1591,52 @@ impl Model {
         }
         kernels::rms_norm(&mut st.normed, &st.after_attn, &l.ffn_norm, s.n_embd, t, eps)?;
         if let Ffn::DenseKq { gate, up, down } = &l.ffn {
+            let tp = self.tp.as_ref().and_then(|tp| {
+                tp.layers
+                    .get(il)
+                    .and_then(|o| o.as_ref())
+                    .and_then(|w| w.ffn.as_ref())
+                    .map(|w| (tp.half, w))
+            });
+            if let (Some((half, bw)), Some(tb)) = (tp, rt.tpb.as_mut()) {
+                // FFN tensor parallel, fully async: the quantized
+                // activation peer-copies to card B on A's stream, B's
+                // stream gates on the handoff event and runs its half,
+                // A's half launches behind it on A's stream, and B's
+                // partial down output peer-copies back behind B's chain
+                // for the gated add on A. ZERO host syncs: the v1 bounce
+                // (sync read/write through pageable host) cost ~6ms of a
+                // 38ms token across 64 layers.
+                kernels::quantize_q8_k(&mut st.xq, &st.normed, s.n_embd, t)?;
+                let xb = t as usize
+                    * (s.n_embd as usize).div_ceil(kernels::Q8_K_BLOCK_ELEMS)
+                    * kernels::Q8_K_BLOCK_BYTES;
+                let primary = kernels::primary_device();
+                tb.lx.send(&st.xq, xb)?;
+                kernels::set_device(tb.dev)?;
+                tb.lx.recv(&mut tb.xq, xb)?;
+                kernels::matmul_kq(&mut tb.gate, &bw.gate.w, &tb.xq, s.n_embd, half, t, bw.gate.row_bytes, bw.gate.quant)?;
+                kernels::matmul_kq(&mut tb.up, &bw.up.w, &tb.xq, s.n_embd, half, t, bw.up.row_bytes, bw.up.quant)?;
+                kernels::swiglu(&mut tb.mid, &tb.gate, &tb.up, t * half, 0.0, 1.0, 0)?;
+                kernels::quantize_q8_k(&mut tb.midq, &tb.mid, half, t)?;
+                kernels::matmul_kq(&mut tb.out, &bw.down.w, &tb.midq, half, s.n_embd, t, bw.down.row_bytes, bw.down.quant)?;
+                tb.lo.send(&tb.out, t as usize * s.n_embd as usize * 4)?;
+                kernels::set_device(primary)?;
+                // A's half runs while B's chain + copies are in flight
+                kernels::matmul_kq(&mut st.gate_act, &gate.w, &st.xq, s.n_embd, half, t, gate.row_bytes, gate.quant)?;
+                kernels::matmul_kq(&mut st.up_act, &up.w, &st.xq, s.n_embd, half, t, up.row_bytes, up.quant)?;
+                kernels::swiglu(&mut st.ffn_mid, &st.gate_act, &st.up_act, t * half, 0.0, 1.0, 0)?;
+                kernels::quantize_q8_k(&mut st.midq, &st.ffn_mid, half, t)?;
+                kernels::matmul_kq(&mut st.ffn_out, &down.w, &st.midq, half, s.n_embd, t, down.row_bytes, down.quant)?;
+                tb.lo.recv(&mut tb.recv, t as usize * s.n_embd as usize * 4)?;
+                kernels::add_assign(&mut st.ffn_out, &tb.recv, t * s.n_embd)?;
+                kernels::add(&mut st.cur, &st.after_attn, &st.ffn_out, t * s.n_embd)?;
+                if prof {
+                    kernels::sync()?;
+                    st.prof.resolve += mark.elapsed();
+                }
+                return Ok(());
+            }
             // dense 27B: resident K-quant triple, no experts, no syncs
             kernels::quantize_q8_k(&mut st.xq, &st.normed, s.n_embd, t)?;
             kernels::matmul_kq(&mut st.gate_act, &gate.w, &st.xq, s.n_embd, s.n_ff_exp, t, gate.row_bytes, gate.quant)?;

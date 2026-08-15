@@ -21,6 +21,53 @@ fn main() {
 }
 
 #[cfg(target_os = "linux")]
+const HELP: &str = "\
+pulsar-cli: generation and diagnostics for the pulsar engine.
+
+usage: pulsar-cli -m MODEL.gguf [-p TEXT | -f FILE | --tokens IDS] [options]
+
+  -m PATH              model gguf (first shard of a split set)
+  -p TEXT              prompt text (BOS prepended unless --no-bos)
+  -f, --prompt-file P  read the prompt from a file (long prompts)
+  --tokens A,B,C       feed exact token ids instead of text
+  -n N                 tokens to generate (default 16)
+  --ctx N              context length (default 2048)
+  --bos / --no-bos     force BOS on/off (default: the gguf's add_bos)
+
+  --chat               interactive multi-turn loop, KV retained per turn
+  --system TEXT        system prompt for --chat
+  --jinja-chat         encode with the Jinja chat template instead of the
+                       built-in markers (network blocked by PULSAR_OFFLINE)
+  --temp F, --top-p F, --min-p F, --seed N
+                       sampling (defaults from general.sampling.* metadata)
+
+diagnostics:
+  --teacher-force      per-position top-5 along the given tokens; with
+                       --dump-logits writes full logit rows instead
+  --dump-logits PATH   write logits (see scripts/kld-ab.sh)
+  --decode-consistency N
+                       compare incremental decode against a fresh prefill
+  --rows-consistency N
+                       check multi-row (speculative verify) logits against
+                       single-token steps at the same positions
+  --dspark-capture A,B,C
+                       check the DSpark hidden-state ring for those
+                       target_layers (dsv4 only)
+
+environment:
+  PULSAR_KV=f32|int8|fp8|fp16|q8_0|q4_0|turbo8|turbo4
+                       KV cache format (default: f32, auto-quantizes when
+                       a big context would starve the expert cache)
+  PULSAR_MTP=1         enable the gguf's nextn head, when it has one
+  PULSAR_DFLASH=PATH   dflash/dspark draft gguf for speculative decode
+  PULSAR_PROFILE=1     per-stage timing report
+  PULSAR_OFFLINE=1     never touch the network
+
+  -V, --version        print version and git sha
+  -h, --help           this text
+";
+
+#[cfg(target_os = "linux")]
 fn main() {
     if let Err(e) = run() {
         eprintln!("pulsar-cli: {e}");
@@ -286,6 +333,8 @@ fn run() -> engine::Result {
     let mut dump_logits = None;
     let mut teacher_force = false;
     let mut decode_consistency = None;
+    let mut rows_consistency = None;
+    let mut dspark_capture: Option<String> = None;
     let mut chat = false;
     let mut system = None;
     let mut temp = None;
@@ -325,6 +374,8 @@ fn run() -> engine::Result {
             "--dump-logits" => dump_logits = Some(need("--dump-logits")?),
             "--teacher-force" => teacher_force = true,
             "--decode-consistency" => decode_consistency = Some(need("--decode-consistency")?.parse::<usize>()?),
+            "--rows-consistency" => rows_consistency = Some(need("--rows-consistency")?.parse::<usize>()?),
+            "--dspark-capture" => dspark_capture = Some(need("--dspark-capture")?),
             "--chat" => chat = true,
             "--system" => system = Some(need("--system")?),
             "--temp" => temp = Some(need("--temp")?.parse::<f32>()?),
@@ -332,7 +383,15 @@ fn run() -> engine::Result {
             "--min-p" => min_p = need("--min-p")?.parse::<f32>()?,
             "--seed" => seed = need("--seed")?.parse::<u64>()?,
             "--jinja-chat" => jinja_chat = true,
-            other => return Err(format!("unknown arg {other}").into()),
+            "-V" | "--version" => {
+                println!("pulsar-cli {}", engine::VERSION);
+                return Ok(());
+            }
+            "-h" | "--help" => {
+                print!("{HELP}");
+                return Ok(());
+            }
+            other => return Err(format!("unknown arg {other}, try --help").into()),
         }
     }
     let model_path = model_path.ok_or("missing -m MODEL.gguf")?;
@@ -342,14 +401,21 @@ fn run() -> engine::Result {
     // load the dflash draft BEFORE the model: the dense-split solver
     // fills cards to capacity from measured free VRAM, so the draft's
     // buffers must already be resident for the split to leave room
-    let mut dflash_draft = match std::env::var("PULSAR_DFLASH") {
-        Ok(p) => {
-            let d = engine::DraftModel::load(std::path::Path::new(&p))?;
+    let mut dflash_draft: Option<engine::DraftModel> = None;
+    let mut dspark_model: Option<engine::Model> = None;
+    if let Ok(p) = std::env::var("PULSAR_DFLASH") {
+        let path = std::path::Path::new(&p);
+        // deepseek4 DSpark drafts are full models (own experts + heads,
+        // scripts/convert-dspark-dsv4.py); dflash-draft ggufs load the
+        // lean qwen35 DraftModel
+        if engine::parse_header(path)?.1.architecture() == Some("deepseek4") {
+            dspark_model = Some(engine::Model::load(path)?);
+            eprintln!("pulsar: dspark draft model loaded ({p})");
+        } else {
+            dflash_draft = Some(engine::DraftModel::load(path)?);
             eprintln!("pulsar: dflash draft loaded ({p})");
-            Some(d)
         }
-        Err(_) => None,
-    };
+    }
     let model = engine::Model::load(std::path::Path::new(&model_path))?;
     let tok = {
         let (_, g) = engine::parse_header(std::path::Path::new(&model_path))?;
@@ -461,9 +527,86 @@ fn run() -> engine::Result {
         }
     }
 
+    // DSpark draft state FIRST, with hard-capped budgets (~2GB): the
+    // target's measuring budget solver then adapts around it, which is
+    // the only direction that works - target-first leaves the draft
+    // nothing once the census matures (measured: cudaMalloc fail), and
+    // an uncapped draft-first starves verify (239ms -> 518ms, a net
+    // loss; a 4-6 row verify costs 3x a draft round). PULSAR_BATCH=8
+    // caps draft staging (it only ever runs block_size rows).
+    // PULSAR_DSPARK_CACHE_GB and PULSAR_DSPARK_RESIDENT=1 raise the
+    // draft's share on boxes with VRAM to spare.
+    let mut dspark_state = match dspark_model.as_ref() {
+        Some(dm) => {
+            let cache_gb = std::env::var("PULSAR_DSPARK_CACHE_GB").unwrap_or_else(|_| "1".into());
+            let saved_cache = std::env::var("PULSAR_DEV_CACHE_GB").ok();
+            let saved_batch = std::env::var("PULSAR_BATCH").ok();
+            let saved_host = std::env::var("PULSAR_CACHE_GB").ok();
+            let saved_tiers = std::env::var("PULSAR_TIERS").ok();
+            std::env::set_var("PULSAR_DEV_CACHE_GB", cache_gb);
+            std::env::set_var("PULSAR_BATCH", "8");
+            // host LFU too: the auto sizing takes min(12GB, avail-6) and
+            // the draft is created first, so without a cap it pins the
+            // RAM the target's own host cache needs (measured: verify
+            // 239ms -> 338ms from host-cache starvation alone)
+            std::env::set_var("PULSAR_CACHE_GB", "2");
+            // no tiers for the draft: a tier RESERVES a spare card's
+            // whole free VRAM as its arena even when it places 97
+            // triples, and the target's tier pass then finds 1GiB free
+            // on both cards (measured; verify 328ms vs 90ms healthy).
+            // PULSAR_DSPARK_RESIDENT flips the priority for boxes with
+            // VRAM to spare.
+            if std::env::var_os("PULSAR_DSPARK_RESIDENT").is_none() {
+                std::env::set_var("PULSAR_TIERS", "off");
+            }
+            let dst = engine::State::new(dm, 512)?;
+            match saved_tiers {
+                Some(v) => std::env::set_var("PULSAR_TIERS", v),
+                None => std::env::remove_var("PULSAR_TIERS"),
+            }
+            match saved_cache {
+                Some(v) => std::env::set_var("PULSAR_DEV_CACHE_GB", v),
+                None => std::env::remove_var("PULSAR_DEV_CACHE_GB"),
+            }
+            match saved_batch {
+                Some(v) => std::env::set_var("PULSAR_BATCH", v),
+                None => std::env::remove_var("PULSAR_BATCH"),
+            }
+            match saved_host {
+                Some(v) => std::env::set_var("PULSAR_CACHE_GB", v),
+                None => std::env::remove_var("PULSAR_CACHE_GB"),
+            }
+            Some(dst)
+        }
+        None => None,
+    };
     let mut st = engine::State::new(&model, ctx)?;
 
     if teacher_force {
+        // With --dump-logits: full-distribution rows for the KV-quant KLD
+        // A/B (scripts/kld-ab.sh). Format: u32 LE n_vocab, then one
+        // n_vocab f32 LE row per position.
+        if let Some(path) = dump_logits.as_ref() {
+            use std::io::Write;
+            let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+            let mut n_vocab = 0usize;
+            for (i, &id) in prompt_ids.iter().enumerate() {
+                let l = model.forward_token(&mut st, id, i as u32, true)?.unwrap();
+                if i == 0 {
+                    n_vocab = l.len();
+                    f.write_all(&(n_vocab as u32).to_le_bytes())?;
+                }
+                for v in &l {
+                    f.write_all(&v.to_le_bytes())?;
+                }
+            }
+            f.flush()?;
+            eprintln!(
+                "pulsar: wrote {} x {n_vocab} logit rows to {path}",
+                prompt_ids.len()
+            );
+            return Ok(());
+        }
         // Per-position top-5 (id, logit) along the given token sequence,
         // one JSON line per position, for cross-engine agreement checks.
         for (i, &id) in prompt_ids.iter().enumerate() {
@@ -476,6 +619,180 @@ fn run() -> engine::Result {
                 .collect();
             println!("{{\"pos\":{},\"after\":{},\"top\":[{}]}}", i, id, entries.join(","));
         }
+        return Ok(());
+    }
+
+    if let Some(spec) = dspark_capture {
+        // Check the DSpark feature ring the draft will read. The failure
+        // modes here are all silent: a slot never written reads as zeros,
+        // a mis-indexed slot duplicates its neighbour, and a mis-indexed
+        // POSITION still looks like a plausible hidden state. So check for
+        // all three rather than eyeballing magnitudes.
+        let layer_ids: Vec<usize> = spec
+            .split(',')
+            .map(|x| x.trim().parse::<usize>())
+            .collect::<std::result::Result<_, _>>()
+            .map_err(|e| format!("--dspark-capture wants a layer list like 41,42,43: {e}"))?;
+        let n_cap = layer_ids.len();
+        let n_embd = model.shape.n_embd as usize;
+        st.enable_dspark_capture(&model, layer_ids.clone())?;
+        model.forward_rows(&mut st, &prompt_ids, 0, 1)?;
+
+        let last = prompt_ids.len() as u32 - 1;
+        println!("dspark capture: layers {layer_ids:?}, {n_cap} x {n_embd} per position");
+        let mut bad = 0;
+        let row = st.dspark_feature_row(&model, last)?;
+        for (i, id) in layer_ids.iter().enumerate() {
+            let slot = &row[i * n_embd..(i + 1) * n_embd];
+            let nz = slot.iter().filter(|v| **v != 0.0).count();
+            let finite = slot.iter().all(|v| v.is_finite());
+            let rms = (slot.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>()
+                / n_embd as f64)
+                .sqrt();
+            if nz == 0 || !finite {
+                bad += 1;
+            }
+            println!(
+                "  hidden[{id}] @pos {last}: rms {rms:.4}, {nz}/{n_embd} nonzero{}",
+                if finite { "" } else { ", NOT FINITE" }
+            );
+        }
+        // slots must differ from each other: equal slots mean one capture
+        // point overwrote another
+        for i in 0..n_cap {
+            for j in i + 1..n_cap {
+                let (a, b) = (&row[i * n_embd..(i + 1) * n_embd], &row[j * n_embd..(j + 1) * n_embd]);
+                if a == b {
+                    println!("  slots {i} and {j} are IDENTICAL (capture points collided)");
+                    bad += 1;
+                }
+            }
+        }
+        // and positions must differ from each other
+        if prompt_ids.len() >= 2 {
+            let prev = st.dspark_feature_row(&model, last - 1)?;
+            if prev == row {
+                println!("  positions {} and {last} are IDENTICAL (position indexing wrong)", last - 1);
+                bad += 1;
+            }
+        }
+        // re-running must reproduce the ring exactly
+        drop(st);
+        let mut st2 = engine::State::new(&model, ctx)?;
+        st2.enable_dspark_capture(&model, layer_ids)?;
+        model.forward_rows(&mut st2, &prompt_ids, 0, 1)?;
+        let again = st2.dspark_feature_row(&model, last)?;
+        // Not a bit-exactness check: with the expert tier active, summing
+        // per-card partials reorders float adds, so two runs of the same
+        // prompt differ slightly by design (PULSAR_TIERS=off restores
+        // exact, and the ring does reproduce bit-for-bit there). What
+        // would be a real bug is a capture that drifts on the order of the
+        // signal itself.
+        // Cosine, not max |d|. Two runs can pick DIFFERENT experts: the
+        // tier reorders float adds, a router logit crosses a neighbour,
+        // and top-6-of-256 selects a different set. That is a genuinely
+        // different hidden state, not a rounding error, so an absolute
+        // bound rejects healthy runs. Direction is what has to hold, and
+        // it must hold exactly (cos 1.0) under PULSAR_TIERS=off.
+        let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
+        for (a, b) in row.iter().zip(&again) {
+            dot += (*a as f64) * (*b as f64);
+            na += (*a as f64) * (*a as f64);
+            nb += (*b as f64) * (*b as f64);
+        }
+        let cos = dot / (na.sqrt() * nb.sqrt()).max(1e-12);
+        if cos < 0.99 {
+            println!("  repeat cosine {cos:.6} is too low to be routing jitter");
+            bad += 1;
+        }
+        println!(
+            "  repeat run: cosine {cos:.6}{}\ndspark capture: {}",
+            if again == row { " (bit-exact)" } else { " (expert routing jitter)" },
+            if bad == 0 { "PASS" } else { "FAIL" }
+        );
+        return Ok(());
+    }
+
+    if let Some(r) = rows_consistency {
+        // Multi-row logits must be (a) identical to the single-row path on
+        // the row they share, and (b) actually distinct positions. A tail
+        // that returned the last row R times would pass (a) alone, so both
+        // halves are load-bearing.
+        if r < 2 || r > prompt_ids.len() {
+            return Err(format!("--rows-consistency needs 2..={} rows", prompt_ids.len()).into());
+        }
+        let all = model
+            .forward_rows(&mut st, &prompt_ids, 0, r as u32)?
+            .ok_or("no logits")?;
+        let nv = all.len() / r;
+
+        // (a) same batching, one row: the shared row must be bit-exact
+        drop(st);
+        let mut st1 = engine::State::new(&model, ctx)?;
+        let one = model
+            .forward_rows(&mut st1, &prompt_ids, 0, 1)?
+            .ok_or("no logits")?;
+        let shared = all[(r - 1) * nv..].iter().zip(&one).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+
+        // (b) each row against a single-token step at that position. The
+        // batched and single-token matmul kernels accumulate in different
+        // orders, so this one is a tolerance check, not bit-exactness.
+        drop(st1);
+        let mut st2 = engine::State::new(&model, ctx)?;
+        let mut per_pos: Vec<Vec<f32>> = Vec::new();
+        for (i, &id) in prompt_ids.iter().enumerate() {
+            let l = model.forward_rows(&mut st2, &[id], i as u32, 1)?.ok_or("no logits")?;
+            if i + r >= prompt_ids.len() {
+                per_pos.push(l);
+            }
+        }
+        // Bit-exactness is NOT the bar here: head_logits dispatches its
+        // matmul by row count, so rows=1 and rows=R accumulate in
+        // different orders. Every family drifts (Laguna, whose multi-row
+        // path ships, drifts more than dsv4). What must hold is that each
+        // row is its OWN position, and that any argmax flip is a near-tie
+        // the drift can explain rather than a wrong row.
+        println!("rows-consistency r={r} over {} tokens:", prompt_ids.len());
+        println!("  shared row (rows=1 vs rows={r}): max |dlogit| {shared:.6}");
+        let mut worst = 0f32;
+        let mut bad = 0;
+        for j in 0..r {
+            let row = &all[j * nv..(j + 1) * nv];
+            let ref_row = &per_pos[j];
+            let d = row.iter().zip(ref_row).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+            let (ra, pa) = (engine::argmax(row), engine::argmax(ref_row));
+            worst = worst.max(d);
+            // top1-top2 on the reference row: a flip inside this gap is
+            // the drift reordering a tie, a flip outside it is a bug
+            let gap = {
+                let (mut t1, mut t2) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+                for &v in ref_row {
+                    if v > t1 {
+                        t2 = t1;
+                        t1 = v;
+                    } else if v > t2 {
+                        t2 = v;
+                    }
+                }
+                t1 - t2
+            };
+            let verdict = if ra == pa {
+                "match"
+            } else if gap <= d {
+                "flip within drift"
+            } else {
+                bad += 1;
+                "FLIP OUTSIDE DRIFT"
+            };
+            println!(
+                "  row {j} (pos {}): max |dlogit| {d:.4}, gap {gap:.4}, argmax {ra} vs {pa} ({verdict})",
+                prompt_ids.len() - r + j,
+            );
+        }
+        println!(
+            "  worst |dlogit| {worst:.4} -> {}",
+            if bad == 0 { "PASS" } else { "FAIL" }
+        );
         return Ok(());
     }
 
@@ -537,6 +854,47 @@ fn run() -> engine::Result {
             seq.len(),
             sum / decode_logits.len() as f64,
             if decode_argmax == fresh_argmax { "MATCH" } else { "FLIP" },
+        );
+        return Ok(());
+    }
+
+    // DSpark speculative decode (deepseek4 + the converted DSpark draft
+    // gguf): PULSAR_DFLASH=/path/to/dspark-draft.gguf, greedy one-shot
+    if let (Some(dm), Some(mut dst), None) =
+        (dspark_model.take(), dspark_state.take(), dump_logits.as_ref())
+    {
+        let mut generated: Vec<u32> = Vec::new();
+        let mut t_first: Option<std::time::Instant> = None;
+        let out = std::io::stdout();
+        engine::generate_dspark(
+            &model,
+            &mut st,
+            &dm,
+            &mut dst,
+            &prompt_ids,
+            0,
+            n_predict,
+            |t| tok.is_eog(t),
+            |t| {
+                t_first.get_or_insert_with(std::time::Instant::now);
+                generated.push(t);
+                use std::io::Write;
+                let mut o = out.lock();
+                o.write_all(&tok.decode(&[t])).ok();
+                o.flush().ok();
+            },
+        )?;
+        println!();
+        st.save_warm(&model)?;
+        let dt = t_first.map(|t| t.elapsed().as_secs_f32()).unwrap_or(0.0);
+        eprintln!(
+            "pulsar: {} tokens in {:.2}s ({:.2} tok/s), dspark {}/{} drafts accepted ({:.0}%)\npulsar: ids {generated:?}",
+            generated.len(),
+            dt,
+            generated.len() as f32 / dt.max(1e-6),
+            st.mtp_accepted,
+            st.mtp_drafted,
+            100.0 * st.mtp_accepted as f64 / st.mtp_drafted.max(1) as f64
         );
         return Ok(());
     }
@@ -661,9 +1019,16 @@ fn run() -> engine::Result {
     let pos0 = prompt_ids.len() as u32;
     let mut generated = Vec::new();
     let t2 = std::time::Instant::now();
+    // greedy one-shot on qwen35: argmax-only rows (device argmax + the
+    // TP vocab-split head) instead of a ~1MB logits readback per token
+    let amax_fast = model.shape.family == engine::Family::Qwen35;
+    let mut next_amax = logits.as_ref().map(|l| engine::argmax(l));
     for pos in pos0..pos0.saturating_add(n_predict as u32) {
-        let l = logits.as_ref().ok_or("no logits")?;
-        let next = engine::argmax(l);
+        let next = if amax_fast {
+            next_amax.ok_or("no argmax")?
+        } else {
+            engine::argmax(logits.as_ref().ok_or("no logits")?)
+        };
         if tok.is_eog(next) {
             break;
         }
@@ -674,7 +1039,15 @@ fn run() -> engine::Result {
         if pos >= ctx {
             break;
         }
-        logits = model.forward_token(&mut st, next, pos, true)?;
+        if amax_fast {
+            st.skip_logit_read = true;
+            let r = model.forward_token(&mut st, next, pos, true);
+            st.skip_logit_read = false;
+            r?;
+            next_amax = st.last_argmax.first().copied();
+        } else {
+            logits = model.forward_token(&mut st, next, pos, true)?;
+        }
     }
     println!();
     if std::env::var_os("PULSAR_PROFILE").is_some() {

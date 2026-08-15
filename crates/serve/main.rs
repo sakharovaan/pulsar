@@ -990,7 +990,10 @@ fn allowed_hosts(bind_host: &str, port: u16) -> Option<Vec<String>> {
 /// rebinding attack can never present as absent.
 #[cfg(target_os = "linux")]
 fn host_allowed(host: Option<&str>, allowed: Option<&Vec<String>>) -> bool {
-    return true;
+    let Some(allowed) = allowed else { return true };
+    let Some(h) = host else { return true };
+    let h = h.to_ascii_lowercase();
+    allowed.contains(&h)
 }
 
 /// True when a POST may proceed: either it carries no `Origin` (every
@@ -1008,7 +1011,76 @@ fn host_allowed(host: Option<&str>, allowed: Option<&Vec<String>>) -> bool {
 /// does not cover that case, and the fix would be a matching origin allowlist.
 #[cfg(target_os = "linux")]
 fn origin_ok(origin: Option<&str>, host: Option<&str>) -> bool {
-    return true;
+    let Some(origin) = origin else { return true };
+    let authority = origin
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(origin);
+    match host {
+        Some(h) => !authority.is_empty() && authority == h,
+        None => false,
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::{allowed_hosts, host_allowed, origin_ok};
+
+    #[test]
+    fn rebinding_guard() {
+        // Default loopback bind: the allowlist is on, because that is the
+        // case where rebinding reaches something the attacker otherwise
+        // could not.
+        let allowed = allowed_hosts("127.0.0.1", 11435);
+        assert!(allowed.is_some());
+        let a = allowed.as_ref();
+        // the ways we are actually reached
+        assert!(host_allowed(Some("127.0.0.1:11435"), a));
+        assert!(host_allowed(Some("localhost:11435"), a));
+        assert!(host_allowed(Some("LocalHost:11435"), a)); // Host is case-insensitive
+        assert!(host_allowed(None, a)); // HTTP/1.0 client
+        // DNS rebinding: attacker's domain resolved to 127.0.0.1. Origin and
+        // Host agree, so origin_ok alone would have let this through.
+        assert!(origin_ok(Some("http://evil.example:11435"), Some("evil.example:11435")));
+        assert!(!host_allowed(Some("evil.example:11435"), a));
+        // right name, wrong port is a different origin
+        assert!(!host_allowed(Some("127.0.0.1:9999"), a));
+    }
+
+    #[test]
+    fn network_bind_accepts_any_host() {
+        // --host 0.0.0.0 is an explicit request to be reachable under names
+        // we cannot enumerate (LAN IP, mDNS name, Tailscale name). Rebinding
+        // buys an attacker nothing there - they can already connect - so the
+        // allowlist would only break the feature. See issue #20.
+        let wild = allowed_hosts("0.0.0.0", 11435);
+        assert!(wild.is_none());
+        assert!(host_allowed(Some("192.168.1.50:11435"), wild.as_ref()));
+        assert!(host_allowed(Some("desktop.local:11435"), wild.as_ref()));
+        // A specific LAN bind is equally a network bind.
+        assert!(allowed_hosts("192.168.1.50", 11435).is_none());
+        // ...but loopback in any spelling stays strict.
+        assert!(allowed_hosts("localhost", 11435).is_some());
+        assert!(allowed_hosts("127.0.0.53", 11435).is_some());
+    }
+
+    #[test]
+    fn csrf_guard() {
+        // non-browser clients send no Origin at all
+        assert!(origin_ok(None, Some("127.0.0.1:8080")));
+        // our own web UI, served from the same host:port
+        assert!(origin_ok(Some("http://127.0.0.1:8080"), Some("127.0.0.1:8080")));
+        assert!(origin_ok(Some("https://box.tail1234.ts.net"), Some("box.tail1234.ts.net")));
+        // a drive-by page: this is the one that used to reach /mcp/server
+        assert!(!origin_ok(Some("https://evil.example"), Some("127.0.0.1:8080")));
+        // same host, different port is still a different origin
+        assert!(!origin_ok(Some("http://127.0.0.1:9999"), Some("127.0.0.1:8080")));
+        // sandboxed iframe / file:// page
+        assert!(!origin_ok(Some("null"), Some("127.0.0.1:8080")));
+        // malformed / absent Host cannot be matched against
+        assert!(!origin_ok(Some("http://127.0.0.1:8080"), None));
+        assert!(!origin_ok(Some("http://"), Some("127.0.0.1:8080")));
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1256,7 +1328,7 @@ fn encode_messages_auto(
     tools: Option<&Vec<serde_json::Value>>,
     enable_thinking: Option<bool>,
     reasoning_effort: Option<&str>,
-) -> Vec<u32> {
+) -> (Vec<u32>, bool) {
     if jinja_chat {
         if let Some(tmpl) = chat_template {
             match encode_messages_jinja(
@@ -1267,7 +1339,7 @@ fn encode_messages_auto(
                 enable_thinking,
                 reasoning_effort,
             ) {
-                Ok(ids) => return ids,
+                Ok(r) => return r,
                 Err(e) => {
                     eprintln!(
                         "pulsar-serve: jinja chat template apply failed ({e}); falling back to ChatMarkers"
@@ -1276,7 +1348,7 @@ fn encode_messages_auto(
             }
         }
     }
-    encode_messages(tok, m, messages, tools)
+    (encode_messages(tok, m, messages, tools), false)
 }
 
 /// Encode OpenAI messages via a resolved Jinja chat template, then
@@ -1289,7 +1361,7 @@ fn encode_messages_jinja(
     tools: Option<&Vec<serde_json::Value>>,
     enable_thinking: Option<bool>,
     reasoning_effort: Option<&str>,
-) -> Result<Vec<u32>, String> {
+) -> Result<(Vec<u32>, bool), String> {
     // DeepSeek V4 speaks DSML; Poolside Laguna speaks arg_key/arg_value XML.
     // Replaying the wrong dialect leaves the model stuck after MCP dispatch.
     let dsml = tool_calls::is_dsml_template(&template.template);
@@ -1402,10 +1474,6 @@ After tool results arrive in <tool_response>, base your answer only on them.",
             "reasoning_effort".into(),
             serde_json::Value::String(e.into()),
         );
-        extra.insert(
-            "thinking_mode".into(),
-            serde_json::Value::String(e.into()),
-        );
     }
     let extra_v = if extra.is_empty() {
         None
@@ -1428,7 +1496,15 @@ After tool results arrive in <tool_response>, base your answer only on them.",
     if std::env::var_os("PULSAR_DEBUG_CHAT").is_some() {
         eprintln!("pulsar-serve: jinja prompt:\n{rendered}");
     }
-    Ok(tok.encode_with_specials(&rendered))
+    // Template truth beats style tables: when the rendered prompt ends
+    // inside an open <think> block (Qwen3.8's default, GLM's, Laguna's),
+    // the reply STARTS as reasoning and the first </think> closes it -
+    // the split sites need to know regardless of ChatStyle.
+    let opened = rendered.trim_end().ends_with("<think>");
+    if std::env::var_os("PULSAR_DEBUG_CHAT").is_some() {
+        eprintln!("pulsar-serve: open_think={opened} tail={:?}", &rendered[rendered.len().saturating_sub(24)..]);
+    }
+    Ok((tok.encode_with_specials(&rendered), opened))
 }
 
 /// Encode OpenAI messages as a Hy3 context: bos, system text, then per
@@ -1693,7 +1769,7 @@ fn handle_chat(
     let temp = req["temperature"].as_f64().map(|v| v as f32).unwrap_or(default_temp);
     let top_p = req["top_p"].as_f64().map(|v| v as f32).unwrap_or(1.0);
     let min_p = req["min_p"].as_f64().map(|v| v as f32).unwrap_or(0.0);
-    let seed = req["seed"].as_u64().unwrap_or(rand::random::<u64>());
+    let seed = req["seed"].as_u64().unwrap_or(42);
     // MCP agentic loop is non-stream only. Force that when tools are enabled
     // so DSML/Hy3 tool markup is never streamed into the chat bubble before
     // extract_tool_calls can strip it.
@@ -1768,7 +1844,7 @@ fn handle_chat(
             reasoning_effort.as_deref(),
         )
     };
-    let prompt = encode(messages);
+    let (prompt, jinja_open_think) = encode(messages);
     if std::env::var_os("PULSAR_DEBUG_IDS").is_some() {
         eprintln!("pulsar-serve: prompt ids {prompt:?}");
     }
@@ -1919,7 +1995,7 @@ fn handle_chat(
         let mut hdr_buf: Vec<u8> = Vec::new();
         // GLM opens the think block in the PROMPT, so the stream begins
         // inside reasoning and the first </think> ends it.
-        let open_think = markers.opens_thinking();
+        let open_think = markers.opens_thinking() || jinja_open_think;
         let mut reasoning = open_think;
         let mut rbytes: Vec<u8> = Vec::new();
         engine::generate_cancellable(
@@ -1969,9 +2045,6 @@ fn handle_chat(
                         }
                     } else if open_think && d.as_slice() == b"</think>" {
                         reasoning = false; // close: the reply starts here
-                    } else if open_think && d.as_slice() == b"</mm:think>" {
-                        reasoning = false; // close: the reply starts here (Minimax tag)
-                    
                     } else if open_think && reasoning {
                         rbytes.extend_from_slice(&d);
                     } else if !FENCE.contains(&d.as_slice()) {
@@ -2088,7 +2161,7 @@ fn handle_chat(
         let mut prev_calls: Vec<(String, String)> = Vec::new();
         let mut empty_nudge_used = false;
         for turn in 0..MAX_TURNS {
-            let tp = encode(&msgs);
+            let (tp, _) = encode(&msgs);
             if tp.len() as u32 + 2 >= st.ctx() {
                 eprintln!(
                     "pulsar-serve: {id}: context exceeded after tool turn {turn} ({} tokens)",
@@ -2150,7 +2223,7 @@ fn handle_chat(
                     full.len()
                 );
             }
-            let (r, c2) = if markers.opens_thinking() {
+            let (r, c2) = if markers.opens_thinking() || jinja_open_think {
                 split_open_think(&c)
             } else {
                 split_harmony(&c)

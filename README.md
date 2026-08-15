@@ -451,7 +451,7 @@ Everything auto-configures; these override. Shared by `pulsar-cli` and
 
 | var | default | what |
 |---|---|---|
-| `PULSAR_KV` | `f32` (serve UI may show `auto`) | GQA K/V storage: `f32`, `fp8`, `fp16`, `int8`, `q8_0`, `q4_0`, `turbo8`, `turbo4` (aliases `rotq*` / `turboq*`). Lossy formats are opt-in so default decode stays bit-exact. **MLA / Dsv4:** latent KV only honors `f32` \| `fp8` \| `fp16` (`turbo*` is GQA-only). `auto` may pick `fp8` when f32 KV would not fit. Prefer `turbo4` for long GQA context |
+| `PULSAR_KV` | `f32` (serve UI may show `auto`) | K/V storage for GQA, qwen35 and **dsv4**: `f32`, `fp8`, `fp16`, `int8`, `q8_0`, `q4_0`, `turbo8`, `turbo4` (aliases `rotq*` / `turboq*`). Lossy formats are opt-in so default decode stays bit-exact. **MLA / K3:** latent KV only honors `f32` \| `fp8` \| `fp16`. `auto` picks `int8` when f32 KV would not fit (`fp8` for the MLA latent cache, its only quantized format). Prefer `turbo4` for long context. Measured quality per codec: [docs/kv-codecs.md](docs/kv-codecs.md) |
 | `PULSAR_CACHE_GB` | measured | host RAM budget for the expert LFU cache |
 | `PULSAR_DEV_CACHE_GB` | solved | VRAM hot-expert pool (free VRAM − staging − reserve) |
 | `PULSAR_BATCH` | solved | prefill chunk size (largest expert-union fit) |
@@ -478,7 +478,12 @@ Everything auto-configures; these override. Shared by `pulsar-cli` and
 | `PULSAR_MTP` | unset | `1` = MTP / nextn speculative decode when the GGUF has a nextn block (greedy) |
 | `PULSAR_MTP_DEPTH` | 3 | draft chain depth for MTP |
 | `PULSAR_NGRAM` | unset | draft-free n-gram speculation depth (greedy; disables some serve prefix-cache paths) |
-| `PULSAR_DFLASH` | unset | path to DFlash draft GGUF (CLI speculative path) |
+| `PULSAR_TP` | unset | `1` = tensor parallel across the two fastest cards (dense qwen35): FFN + GDN + attention head-sharded, multi-device CUDA graphs. Pin devices with `CUDA_DEVICE_ORDER=PCI_BUS_ID PULSAR_GPU=0` |
+| `PULSAR_DFLASH` | unset | path to draft GGUF (CLI speculative path): DFlash for qwen35, converted DSpark for deepseek4 |
+| `PULSAR_DSPARK_DEPTH` | 3 | dsv4 DSpark: tokens drafted per round (1..block_size; deeper measured slower) |
+| `PULSAR_DSPARK_CONF` | 0.5 | dsv4 DSpark: confidence prefix-cut probability; `off` disables the cut |
+| `PULSAR_DSPARK_CACHE_GB` | 1 | dsv4 DSpark: draft state's VRAM expert cache |
+| `PULSAR_DSPARK_RESIDENT` | unset | set = tier the draft's WHOLE expert set (~9.6GiB; needs spare VRAM, see README) |
 | `PULSAR_GRAPHS` | on | `0` = disable CUDA graphs where supported (e.g. Qwen3.5) |
 
 #### Chat templates (serve + CLI chat)
@@ -541,6 +546,30 @@ whole batch), an expert slab resolves through:
 A background thread additionally **prefetches the next layer's experts**,
 predicted by running the next layer's router on the current layer's
 input.
+
+### Spreading a model across several SSDs
+
+Each shard of a split gguf is opened as its own fd and the fetcher routes
+every read to the right one, so a multi-shard model can live on several
+drives and be read from all of them at once. Shard discovery expands
+`-00001-of-000NN` inside one directory, but those entries may be
+symlinks:
+
+```sh
+mkdir -p /models/v4 && cd /models/v4
+ln -s /mnt/fast0/DeepSeek-V4-Flash-0731-UD-Q2_K_XL-00001-of-00003.gguf .
+ln -s /mnt/fast1/DeepSeek-V4-Flash-0731-UD-Q2_K_XL-00002-of-00003.gguf .
+ln -s /mnt/fast2/DeepSeek-V4-Flash-0731-UD-Q2_K_XL-00003-of-00003.gguf .
+pulsar-serve -m /models/v4/DeepSeek-V4-Flash-0731-UD-Q2_K_XL-00001-of-00003.gguf
+```
+
+That buys capacity, and read parallelism across drives for free. It is
+worth measuring before buying disks for *bandwidth*, though: on a PCIe
+5.0 x4 drive `fetch-bench` sustains ~10.7 GB/s of real expert slabs and
+is flat from queue depth 4 to 128, while decode only pulls 1.4-2.1 GB/s
+off the disk because the resident tier and host cache absorb most of the
+lookups. Streaming decode is usually latency- and compute-bound well
+before a single modern NVMe runs out of bandwidth.
 
 The MoE kernels never consult global state: every launch receives
 explicit per-(token, slot) device pointers for gate/up/down, and a NULL
@@ -630,6 +659,25 @@ falls behind again: the round's remaining fixed costs (a ~95ms verify
 floor of per-layer launches and router readbacks, a draft whose cost
 grows with the feature window) need acceptance ~7+ to amortize, and
 measured acceptance is 4.3 on math, less on prose.
+
+Same story, next family: DSpark speculative decoding for DeepSeek V4
+Flash, from the official draft (`scripts/convert-dspark-dsv4.py`
+rewrites unsloth's `dflash` gguf into a 3-layer `deepseek4` model the
+normal loader takes; the five DSpark head tensors - fc, main norm,
+markov bigram pair, confidence - load beside it). The draft is
+stateless by construction: every round recomputes its 128-row window
+K from the target's captured hidden means, so there is no draft cache
+and nothing to roll back. Verify is one batched multi-row target
+forward; recurrent-lane checkpoints restore and replay only on partial
+accepts. Output is byte-identical to plain greedy, acceptance is
+70-79% per drafted token, and on the reference box it is opt-in
+experimental for the same honest reason as DFlash: 8.3-8.8 tok/s
+against 11.3 sequential. Expert-streaming decode is bandwidth-bound,
+and speculative rows multiply routed-expert traffic instead of
+amortizing it - verify rows do not share experts. The regime flips
+only when the draft's own experts are VRAM-resident, which costs
+9.6GiB this box cannot spare next to a 90GB target
+(`PULSAR_DSPARK_RESIDENT=1` claims it anyway on boxes that can).
 MCP (Model Context Protocol) tool-use in pulsar-serve, opt-in via
 `--webui-mcp-proxy`: the server connects to configured MCP servers
 (rmcp 3.0.1; stdio + streamable-http), exposes their tools to the model
@@ -654,6 +702,10 @@ Not yet:
 - deepseek4 perf pass: batched prefill (prompts currently process
   sequentially), resident tiers + cross-layer prefetch for the dsv4
   resolve, fewer host syncs on the hyper-connection gates
+- DSpark, remaining: per-row recurrent-lane snapshots inside verify
+  (kills the replay forward on partial accepts, the DFlash fast-
+  rollback move), and a measured `PULSAR_DSPARK_RESIDENT` run on a
+  box with 10GB+ spare VRAM, where the math says it wins
 - tensor-core unpackers for the remaining expert formats (iq2_xs,
   iq3_xxs, q4_K, q5_1, q2_K, q3_K, the harness takes one ~40-line
   unpacker per format)

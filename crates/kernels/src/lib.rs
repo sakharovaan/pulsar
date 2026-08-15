@@ -65,6 +65,7 @@ mod real {
     pub const QUANT_IQ3_S: u32 = 14;
     pub const QUANT_IQ2_S: u32 = 15;
     pub const QUANT_IQ1_S: u32 = 16;
+    pub const QUANT_NVFP4: u32 = 17;
 
     const H2D: i32 = 1;
     const D2H: i32 = 2;
@@ -113,7 +114,12 @@ mod real {
         fn pulsar_moe_down_bias(out: *mut c_void, ptrs: *const c_void, weights: *const c_void, out_dim: u32, n_used: u32, n_tok: u32) -> i32;
         fn pulsar_add_bias_rows(x: *mut c_void, bias: *const c_void, dim: u32, rows: u32) -> i32;
         fn pulsar_gqa_head_rms_norm(x: *mut c_void, w: *const c_void, rows: u32, head_dim: u32, eps: f32) -> i32;
-        fn pulsar_gqa_rope(x: *mut c_void, n_tok: u32, n_head: u32, head_dim: u32, rot_dim: u32, pos0: u32, theta: f32, factors: *const c_void) -> i32;
+        fn pulsar_gqa_rope_dev(x: *mut c_void, n_tok: u32, n_head: u32, head_dim: u32, rot_dim: u32, pos_dev: *const c_void, theta: f32) -> i32;
+        fn pulsar_gqa_kv_append_dev(cache: *mut c_void, kv: *const c_void, n_tok: u32, n_kv_head: u32, head_dim: u32, cap: u32, pos_dev: *const c_void) -> i32;
+        fn pulsar_gqa_attention_dev(out: *mut c_void, q: *const c_void, k: *const c_void, v: *const c_void, n_tok: u32, n_head: u32, n_kv_head: u32, head_dim: u32, cap: u32, pos_dev: *const c_void, scale: f32) -> i32;
+        fn pulsar_set_u32(dst: *mut c_void, v: u32) -> i32;
+        fn pulsar_argmax_rows(out: *mut c_void, x: *const c_void, n: u32, rows: u32) -> i32;
+         fn pulsar_gqa_rope(x: *mut c_void, n_tok: u32, n_head: u32, head_dim: u32, rot_dim: u32, pos0: u32, theta: f32, factors: *const c_void) -> i32;
         fn pulsar_gqa_kv_append(cache: *mut c_void, kv: *const c_void, n_tok: u32, n_kv_head: u32, head_dim: u32, cap: u32, pos0: u32, kvq: u32) -> i32;
         fn pulsar_gqa_attention(out: *mut c_void, q: *const c_void, k_cache: *const c_void, v_cache: *const c_void, n_tok: u32, n_head: u32, n_kv_head: u32, head_dim: u32, cap: u32, pos0: u32, scale: f32, window: u32, rel: *const c_void, rel_extent: u32, kvq: u32, sinks: *const c_void) -> i32;
 
@@ -333,6 +339,45 @@ mod real {
         let mut n = 0;
         unsafe { cudaGetDeviceCount(&mut n) };
         n
+    }
+
+    /// Measured VRAM bandwidth of `dev` in GB/s: a 64MB on-card D2D copy
+    /// (reads + writes VRAM, so ~2x the copy rate; reported as copy rate
+    /// x2). H2D probes measure the PCIe LINK, which is the wrong axis
+    /// for placing dense-resident weights - those are read from the
+    /// card's own VRAM every token. Measured, not derived: the
+    /// memoryClockRate attribute is deprecated and reads 0 on Blackwell,
+    /// which silently tied a 448GB/s card with a 288GB/s one. Restores
+    /// the current device; returns 0.0 on any probe failure so a broken
+    /// card ranks last instead of erroring placement.
+    pub fn vram_bandwidth(dev: i32) -> f64 {
+        const MB64: usize = 64 << 20;
+        const D2D_KIND: i32 = 3;
+        let cur = get_device();
+        if set_device(dev).is_err() {
+            return 0.0;
+        }
+        let mut a = std::ptr::null_mut();
+        let mut b = std::ptr::null_mut();
+        let mut best = 0f64;
+        if unsafe { cudaMalloc(&mut a, MB64) } == 0 {
+            if unsafe { cudaMalloc(&mut b, MB64) } == 0 {
+                // one warmup, then best of 3 timed synchronous copies
+                unsafe { cudaMemcpy(b, a, MB64, D2D_KIND) };
+                for _ in 0..3 {
+                    let t = std::time::Instant::now();
+                    if unsafe { cudaMemcpy(b, a, MB64, D2D_KIND) } == 0
+                        && unsafe { cudaDeviceSynchronize() } == 0
+                    {
+                        best = best.max(2.0 * MB64 as f64 / 1e9 / t.elapsed().as_secs_f64());
+                    }
+                }
+                unsafe { cudaFree(b) };
+            }
+            unsafe { cudaFree(a) };
+        }
+        let _ = set_device(cur);
+        best
     }
 
     /// Measured H2D bandwidth to `dev` in GB/s (pinned 64MB, best of 3).
@@ -657,10 +702,74 @@ mod real {
     extern "C" {
         fn cudaStreamCreateWithFlags(s: *mut *mut c_void, flags: u32) -> i32;
         fn cudaMemcpyAsync(dst: *mut c_void, src: *const c_void, bytes: usize, kind: i32, stream: *mut c_void) -> i32;
+        fn cudaMemcpyPeerAsync(dst: *mut c_void, dst_dev: i32, src: *const c_void, src_dev: i32, bytes: usize, stream: *mut c_void) -> i32;
         fn cudaEventCreateWithFlags(e: *mut *mut c_void, flags: u32) -> i32;
         fn cudaEventRecord(e: *mut c_void, stream: *mut c_void) -> i32;
         fn cudaEventQuery(e: *mut c_void) -> i32;
+        fn cudaEventDestroy(e: *mut c_void) -> i32;
         fn cudaStreamWaitEvent(stream: *mut c_void, e: *mut c_void, flags: u32) -> i32;
+    }
+
+    /// Cross-device handoff for tensor parallel: an async D2H into a
+    /// PINNED staging buffer on the source device's null stream, an
+    /// event, and an async H2D on the consumer device's null stream
+    /// gated on that event. No host syncs anywhere, both DMA engines,
+    /// fully known behavior. NOT cudaMemcpyPeerAsync: without P2P
+    /// access (GeForce) the driver stages peer copies with implicit
+    /// synchronization on BOTH devices - measured 26.4 -> 18.8 tok/s,
+    /// worse than v1's plain sync bounces.
+    ///
+    /// Create with the SOURCE device current (the event records there).
+    /// Host-call order per use: `send` on the source device, then
+    /// `recv` on the consumer BEFORE the same link's next `send`.
+    pub struct TpLink {
+        ev: *mut c_void,
+        pin: DeviceBuf,
+    }
+
+    unsafe impl Send for TpLink {}
+
+    impl TpLink {
+        pub fn new(bytes: usize) -> Result<TpLink> {
+            ensure_device();
+            const DISABLE_TIMING: u32 = 2;
+            let mut ev = std::ptr::null_mut();
+            check_rt(unsafe { cudaEventCreateWithFlags(&mut ev, DISABLE_TIMING) }, "tplink event")?;
+            Ok(TpLink { ev, pin: DeviceBuf::alloc_pinned(bytes)? })
+        }
+
+        /// Async D2H of `bytes` from `src` into the pinned stage, on the
+        /// CURRENT (source) device's per-thread default stream (the
+        /// stream the kernels launch on, and the only stream CUDA graph
+        /// capture may record - the legacy null stream is capture-
+        /// illegal), event behind it.
+        pub fn send(&self, src: &DeviceBuf, bytes: usize) -> Result {
+            assert!(bytes <= self.pin.bytes() && bytes <= src.bytes());
+            check_rt(
+                unsafe { cudaMemcpyAsync(self.pin.host, src.ptr(), bytes, D2H, STREAM_PER_THREAD) },
+                "tplink d2h",
+            )?;
+            check_rt(unsafe { cudaEventRecord(self.ev, STREAM_PER_THREAD) }, "tplink record")
+        }
+
+        /// Gate the CURRENT (consumer) device's per-thread default stream
+        /// on the last send, then async H2D from the pinned stage into
+        /// `dst`. During graph capture this wait is the edge that JOINS
+        /// the consumer device's stream into the capture DAG.
+        pub fn recv(&self, dst: &mut DeviceBuf, bytes: usize) -> Result {
+            assert!(bytes <= self.pin.bytes() && bytes <= dst.bytes());
+            check_rt(unsafe { cudaStreamWaitEvent(STREAM_PER_THREAD, self.ev, 0) }, "tplink wait")?;
+            check_rt(
+                unsafe { cudaMemcpyAsync(dst.ptr_mut(), self.pin.host, bytes, H2D, STREAM_PER_THREAD) },
+                "tplink h2d",
+            )
+        }
+    }
+
+    impl Drop for TpLink {
+        fn drop(&mut self) {
+            unsafe { cudaEventDestroy(self.ev) };
+        }
     }
 
     /// A side stream + event for best-effort background H2D staging.
@@ -1032,6 +1141,55 @@ mod real {
     }
 
     #[allow(clippy::too_many_arguments)] // kernel launch mirrors the CUDA signature
+    /// Device-position rope (multi-device graph capture): position read
+    /// from a device word instead of a baked argument.
+    pub fn gqa_rope_dev(x: &mut DeviceBuf, n_tok: u32, n_head: u32, head_dim: u32, rot_dim: u32, pos_dev: &DeviceBuf, theta: f32) -> Result {
+        check(unsafe { pulsar_gqa_rope_dev(x.ptr_mut(), n_tok, n_head, head_dim, rot_dim, pos_dev.ptr(), theta) }, "gqa_rope_dev")
+    }
+
+    pub fn gqa_kv_append_dev(cache: &mut DeviceBuf, kv: &DeviceBuf, n_tok: u32, n_kv_head: u32, head_dim: u32, cap: u32, pos_dev: &DeviceBuf) -> Result {
+        check(unsafe { pulsar_gqa_kv_append_dev(cache.ptr_mut(), kv.ptr(), n_tok, n_kv_head, head_dim, cap, pos_dev.ptr()) }, "gqa_kv_append_dev")
+    }
+
+    /// f32 KV, plain single-pass kernel (no split-K): the engine gates
+    /// this to contexts below the split threshold.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gqa_attention_dev(out: &mut DeviceBuf, q: &DeviceBuf, k: &DeviceBuf, v: &DeviceBuf, n_tok: u32, n_head: u32, n_kv_head: u32, head_dim: u32, cap: u32, pos_dev: &DeviceBuf, scale: f32) -> Result {
+        check(unsafe { pulsar_gqa_attention_dev(out.ptr_mut(), q.ptr(), k.ptr(), v.ptr(), n_tok, n_head, n_kv_head, head_dim, cap, pos_dev.ptr(), scale) }, "gqa_attention_dev")
+    }
+
+    /// Row-wise argmax on device: 8 bytes back per row - a (value,
+    /// index) pair, so vocab-split halves merge host-side exactly like
+    /// one full scan. First index wins ties (matches the host scan).
+    pub fn argmax_rows_pairs(out: &mut DeviceBuf, x: &DeviceBuf, n: u32, rows: u32) -> Result<Vec<(f32, u32)>> {
+        check(unsafe { pulsar_argmax_rows(out.ptr_mut(), x.ptr(), n, rows) }, "argmax_rows")?;
+        sync()?;
+        let raw = out.read_f32(rows as usize * 2)?;
+        Ok((0..rows as usize).map(|i| (raw[i * 2], raw[i * 2 + 1].to_bits())).collect())
+    }
+
+    pub fn argmax_rows(out: &mut DeviceBuf, x: &DeviceBuf, n: u32, rows: u32) -> Result<Vec<u32>> {
+        Ok(argmax_rows_pairs(out, x, n, rows)?.into_iter().map(|(_, i)| i).collect())
+    }
+
+    /// Launch-only argmax (no sync): the vocab-split head launches one
+    /// per card and reads both AFTER both chains are in flight.
+    pub fn argmax_rows_launch(out: &mut DeviceBuf, x: &DeviceBuf, n: u32, rows: u32) -> Result {
+        check(unsafe { pulsar_argmax_rows(out.ptr_mut(), x.ptr(), n, rows) }, "argmax_rows")
+    }
+
+    /// Read back (value, index) pairs from an argmax_rows_launch (syncs
+    /// the buffer's device).
+    pub fn argmax_pairs_read(out: &DeviceBuf, rows: u32) -> Result<Vec<(f32, u32)>> {
+        let raw = out.read_f32(rows as usize * 2)?;
+        Ok((0..rows as usize).map(|i| (raw[i * 2], raw[i * 2 + 1].to_bits())).collect())
+    }
+
+    /// Async one-thread device write (per-token position cells).
+    pub fn set_u32(dst: &mut DeviceBuf, v: u32) -> Result {
+        check(unsafe { pulsar_set_u32(dst.ptr_mut(), v) }, "set_u32")
+    }
+
     pub fn gqa_rope(x: &mut DeviceBuf, n_tok: u32, n_head: u32, head_dim: u32, rot_dim: u32, pos0: u32, theta: f32, factors: Option<&DeviceBuf>) -> Result {
         check(unsafe { pulsar_gqa_rope(x.ptr_mut(), n_tok, n_head, head_dim, rot_dim, pos0, theta, factors.map_or(std::ptr::null(), |b| b.ptr())) }, "gqa_rope")
     }
@@ -1314,6 +1472,52 @@ mod real {
     }
 
     /// In place over [n_tok][n_head]: g = a*softplus(g+dt), beta = sigmoid(beta).
+    /// Coeffs over a PACKED [g | beta] row (the concatenated alpha/beta
+    /// matmul at n_tok == 1): same kernel, offset pointers.
+    pub fn qwen35_gdn_coeffs_packed(gb: &mut DeviceBuf, beta_off: usize, a: &DeviceBuf, dt: &DeviceBuf, n_head: u32) -> Result {
+        check(
+            unsafe {
+                pulsar_qwen35_gdn_coeffs(
+                    gb.ptr_mut(),
+                    (gb.ptr_mut() as *mut u8).add(beta_off) as *mut c_void,
+                    a.ptr(), dt.ptr(), 1, n_head,
+                )
+            },
+            "qwen35_gdn_coeffs",
+        )
+    }
+
+    /// gdn_batch reading g/beta from one packed row (n_tok == 1).
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen35_gdn_batch_packed(out: &mut DeviceBuf, state: &mut DeviceBuf, q: &DeviceBuf, k: &DeviceBuf, v: &DeviceBuf, gb: &DeviceBuf, beta_off: usize, h_v: u32, h_k: u32, dim: u32) -> Result {
+        check(
+            unsafe {
+                pulsar_qwen35_gdn_batch(
+                    out.ptr_mut(), state.ptr_mut(), q.ptr(), k.ptr(), v.ptr(),
+                    gb.ptr(),
+                    (gb.ptr() as *const u8).add(beta_off) as *const c_void,
+                    h_v, h_k, dim, 1,
+                )
+            },
+            "qwen35_gdn_batch",
+        )
+    }
+
+    /// matmul_f32 with a byte offset into the weight (the concatenated
+    /// alpha/beta tensor's halves at n_tok > 1).
+    pub fn matmul_f32_off(out: &mut DeviceBuf, w: &DeviceBuf, w_off: usize, x: &DeviceBuf, in_dim: u32, out_dim: u32, n_tok: u32) -> Result {
+        check(
+            unsafe {
+                pulsar_matmul_f32(
+                    out.ptr_mut(),
+                    (w.ptr() as *const u8).add(w_off) as *const c_void,
+                    x.ptr(), in_dim, out_dim, n_tok,
+                )
+            },
+            "matmul_f32",
+        )
+    }
+
     pub fn qwen35_gdn_coeffs(g_alpha: &mut DeviceBuf, beta: &mut DeviceBuf, a: &DeviceBuf, dt: &DeviceBuf, n_tok: u32, n_head: u32) -> Result {
         check(unsafe { pulsar_qwen35_gdn_coeffs(g_alpha.ptr_mut(), beta.ptr_mut(), a.ptr(), dt.ptr(), n_tok, n_head) }, "qwen35_gdn_coeffs")
     }
@@ -1415,6 +1619,50 @@ mod tests {
     #[ignore = "requires a CUDA device"]
     fn gqa_kernels_match_cpu_reference() {
         assert!(super::gqa_selftest());
+    }
+
+    /// Effective bandwidth of matmul_kq per quant on a dense-27B FFN
+    /// shape - a probe, not a correctness test (weights are pseudorandom
+    /// bytes; every wdot path is branchless so timing is data-blind).
+    /// cargo test --release -p kernels kq_bandwidth -- --ignored --nocapture
+    #[test]
+    #[ignore = "perf probe, requires a CUDA device"]
+    fn kq_bandwidth_probe() {
+        use super::*;
+        let rows = 17408u32;
+        let in_dim = 5120u32;
+        let blocks = (in_dim / 256) as usize;
+        for &(q, name, bpb) in &[
+            (QUANT_Q4_K, "q4_K", 144usize),
+            (QUANT_Q5_K, "q5_K", 176),
+            (QUANT_Q6_K, "q6_K", 210),
+            (QUANT_IQ4_XS, "iq4_xs", 136),
+            (QUANT_NVFP4, "nvfp4", 144),
+        ] {
+            let rb = blocks * bpb;
+            let wbytes = rows as usize * rb;
+            let mut w = DeviceBuf::alloc(wbytes).unwrap();
+            let host: Vec<u8> = (0..wbytes).map(|i| (i.wrapping_mul(2654435761) >> 7) as u8).collect();
+            w.write(0, &host).unwrap();
+            let x: Vec<f32> = (0..in_dim as usize).map(|i| ((i * 37) % 97) as f32 * 0.01 - 0.5).collect();
+            let mut xf = DeviceBuf::alloc(in_dim as usize * 4).unwrap();
+            xf.write(0, as_bytes(&x)).unwrap();
+            let mut xq = DeviceBuf::alloc(blocks * Q8_K_BLOCK_BYTES).unwrap();
+            quantize_q8_k(&mut xq, &xf, in_dim, 1).unwrap();
+            let mut out = DeviceBuf::alloc(rows as usize * 4).unwrap();
+            for _ in 0..3 {
+                matmul_kq(&mut out, &w, &xq, in_dim, rows, 1, rb as u64, q).unwrap();
+            }
+            sync().unwrap();
+            let iters = 200;
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters {
+                matmul_kq(&mut out, &w, &xq, in_dim, rows, 1, rb as u64, q).unwrap();
+            }
+            sync().unwrap();
+            let dt = t0.elapsed().as_secs_f64() / iters as f64;
+            eprintln!("kq {name}: {:6.1} GB/s ({:.0} us, {}MB)", wbytes as f64 / dt / 1e9, dt * 1e6, wbytes >> 20);
+        }
     }
 
     #[test]

@@ -1287,15 +1287,35 @@ __device__ __forceinline__ static float mxfp4_scale_half(uint8_t e) {
     return f;
 }
 
-/* Map 4 packed nibbles to 4 int8 table values, one byte lane each. */
+/* Map 4 packed nibbles to 4 int8 table values, one byte lane each.
+ * REGISTER PRMT lookup like iq4nl_lut4: kd-style __constant__ tables
+ * serialize on divergent per-lane indices (measured 6x on iq4_xs), and
+ * NVFP4 puts this codebook in the dense decode hot path. Selector
+ * nibbles pack contiguously into bits [15:0]; bit 3 must stay clear
+ * (PRMT MSB-replication mode), the 8-15 half rides the second pair. */
 __device__ __forceinline__ static int32_t mxfp4_lookup4(uint32_t nib) {
-    const uint8_t *n = (const uint8_t *)&nib;
-    int8_t out[4];
-    #pragma unroll
-    for (int i = 0; i < 4; i++) out[i] = mxfp4_kv[n[i] & 0x0f];
-    int32_t packed;
-    memcpy(&packed, out, 4);
-    return packed;
+    const uint32_t t0 = 0x03020100u, t1 = 0x0C080604u; /* kv[0..7] */
+    const uint32_t t2 = 0xFDFEFF00u, t3 = 0xF4F8FAFCu; /* kv[8..15] */
+    const uint32_t s = (nib & 0x7u)
+        | ((nib >> 4) & 0x70u)
+        | ((nib >> 8) & 0x700u)
+        | ((nib >> 12) & 0x7000u);
+    const uint32_t lo = __byte_perm(t0, t1, s);
+    const uint32_t hi = __byte_perm(t2, t3, s);
+    const uint32_t m = __vcmpeq4(nib & 0x08080808u, 0u);
+    return (int32_t)((lo & m) | (hi & ~m));
+}
+
+/* UE4M3 block scale decode, ggml_ue4m3_to_fp32 verbatim: unsigned, 4
+ * exponent bits (bias 7), 3 mantissa bits; 0 and 0x7F decode to zero;
+ * the result carries the *0.5 that compensates the doubled codebook. */
+__device__ __forceinline__ static float ue4m3_half(uint8_t x) {
+    if (x == 0 || x == 0x7F) return 0.0f;
+    const int exp = (x >> 3) & 0xF;
+    const int man = x & 7;
+    const float raw = exp == 0 ? ldexpf((float)man, -9)
+                               : ldexpf(1.0f + (float)man / 8.0f, exp - 7);
+    return raw * 0.5f;
 }
 
 typedef struct {
@@ -1574,20 +1594,37 @@ __device__ static float dev_dot_q5_K_q8_K_block(const block_q5_K *x, const block
     return d * (float)isum - dmin * (float)msum;
 }
 
-/* iq4_xs non-linear codebook (ggml kvalues_iq4nl). __constant__ like every
- * other codebook here: the whole warp indexes it with the same address
- * pattern, which the constant cache broadcasts in one shot where a global
- * load goes through L1 per thread. */
-__device__ __constant__ static const int8_t kd_iq4nl[16] = {
-    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+/* iq4_xs/iq4_nl non-linear codebook (ggml kvalues_iq4nl) lives as PRMT
+ * immediates inside iq4nl_lut4 below - see the note there for why a
+ * __constant__ table is the wrong home for divergent per-lane indices. */
 
 /* Resolve four 4-bit codebook indices (one per byte of `nib4`, already
- * masked) into four int8 weights packed as one int, ready for __dp4a. */
+ * masked) into four int8 weights packed as one int, ready for __dp4a.
+ * REGISTER lookup, not kd_iq4nl: constant memory broadcasts only when
+ * the warp reads ONE address, and here every lane carries different
+ * nibbles, so the constant cache serialized up to 32 replays per load -
+ * measured 67.6 GB/s vs 401 for q4_K on the same matvec shape. The 16
+ * codebook bytes pack into four immediates; two PRMT selects (entries
+ * 0-7 and 8-15) and a per-byte mask on nibble bit 3 pick between them.
+ * PRMT selector nibbles must stay 0-7: bit 3 flips PRMT into MSB
+ * replication mode, hence the 0x07070707 mask. */
 __device__ __forceinline__ static int iq4nl_lut4(uint32_t nib4) {
-    return (int)(((uint32_t)(uint8_t)kd_iq4nl[(nib4      ) & 0xfu])
-               | ((uint32_t)(uint8_t)kd_iq4nl[(nib4 >>  8) & 0xfu] << 8)
-               | ((uint32_t)(uint8_t)kd_iq4nl[(nib4 >> 16) & 0xfu] << 16)
-               | ((uint32_t)(uint8_t)kd_iq4nl[(nib4 >> 24) & 0xfu] << 24));
+    /* kvalues_iq4nl bytes, little-endian words: [0..3] [4..7] [8..11] [12..15] */
+    const uint32_t t0 = 0xBFAD9881u, t1 = 0xF6EADDCFu;
+    const uint32_t t2 = 0x26190D01u, t3 = 0x71594535u;
+    /* PRMT reads its four selector nibbles from bits [15:0] CONTIGUOUSLY
+     * (result byte i <- s[4i+3 : 4i]), so the per-byte indices compress
+     * into the low half first; bit 3 of each stays clear (>= 8 would flip
+     * PRMT into MSB-replication mode), the 8-15 half rides the second
+     * table pair instead. */
+    const uint32_t s = (nib4 & 0x7u)
+        | ((nib4 >> 4) & 0x70u)
+        | ((nib4 >> 8) & 0x700u)
+        | ((nib4 >> 12) & 0x7000u);
+    const uint32_t lo = __byte_perm(t0, t1, s);
+    const uint32_t hi = __byte_perm(t2, t3, s);
+    const uint32_t m = __vcmpeq4(nib4 & 0x08080808u, 0u); /* 0xFF where idx < 8 */
+    return (int)((lo & m) | (hi & ~m));
 }
 
 __device__ static float dev_dot_iq4_xs_q8_K_block(const block_iq4_xs *x, const block_q8_K *y) {
@@ -1875,6 +1912,36 @@ __device__ static float dev_dot_mxfp4_q8_K_block(const char *row, const block_q8
     return y->d * sumf;
 }
 
+/* nvfp4: four 64-element blocks per q8_K super-block, each holding four
+ * UE4M3-scaled 16-value sub-blocks (ggml block_nvfp4: 4 scale bytes then
+ * 32 nibble bytes = 36 B, 4-aligned). Same doubled-e2m1 codebook as
+ * mxfp4; ue4m3_half carries the compensating half. Within a sub-block
+ * the low nibbles are values 0..7 and the high nibbles 8..15. */
+__device__ static float dev_dot_nvfp4_q8_K_block(const char *row, const block_q8_K *y) {
+    const int8_t *q8 = y->qs;
+    float sumf = 0.0f;
+    for (int b = 0; b < 4; b++) {
+        const char *bp = row + (uint64_t)b * 36u;
+        #pragma unroll
+        for (int sub = 0; sub < 4; sub++) {
+            uint8_t e;
+            memcpy(&e, bp + sub, 1);
+            int sumi = 0;
+            #pragma unroll
+            for (int i = 0; i < 8; i += 4) {
+                uint32_t v;
+                memcpy(&v, bp + 4 + sub * 8 + i, 4);
+                sumi = __dp4a(mxfp4_lookup4(v & 0x0f0f0f0fu),
+                              *(const int32_t *)(q8 + b * 64 + sub * 16 + i), sumi);
+                sumi = __dp4a(mxfp4_lookup4((v >> 4) & 0x0f0f0f0fu),
+                              *(const int32_t *)(q8 + b * 64 + sub * 16 + 8 + i), sumi);
+            }
+            sumf += ue4m3_half(e) * (float)sumi;
+        }
+    }
+    return y->d * sumf;
+}
+
 /* iq4_nl: eight 32-element blocks per q8_K super-block. Same codebook and
  * same packed-lookup + dp4a path as iq4_xs; only the blocking differs (one
  * f16 scale per 32 values instead of 6-bit sub-scales over 256). Blocks are
@@ -2000,6 +2067,12 @@ struct dot_mxfp4 {
     __device__ __forceinline__ static float block(const char *row, const block_q8_K *xq, uint32_t b) {
         /* 8 mxfp4 blocks per 256-element q8_K block */
         return dev_dot_mxfp4_q8_K_block(row + (uint64_t)b * 8u * sizeof(block_mxfp4), xq + b);
+    }
+};
+
+struct dot_nvfp4 {
+    __device__ __forceinline__ static float block(const char *row, const block_q8_K *xq, uint32_t b) {
+        return dev_dot_nvfp4_q8_K_block(row + (uint64_t)b * 144u, xq + b);
     }
 };
 
@@ -2169,6 +2242,132 @@ struct dot_q5_K {
     }
 };
 
+/* q4_K plus the qh high-bit plane: q = nibble | (qh bit << 4), scales
+ * and mins identical (k4_scale_min). Same lane layout as wdot_q4_K:
+ * chunk j = lane/8 (64 values), word wi = 4*(lane%8). For chunk j the
+ * low nibbles carry qh bit 2j, the high nibbles bit 2j+1, both indexed
+ * by the value's position l = wi..wi+3 (qh is 32 bytes, reused across
+ * chunks). block_q5_K is 176 bytes = 4-aligned rows, so the direct u32
+ * loads q4_K uses are legal here too (q6_K's 210 needed byte loads).
+ * Added for Qwen3.8-27B UD-Q4_K_XL, which ships attention and FFN
+ * mostly Q5_K: the generic per-lane dot ran the dense FFN at 161ms a
+ * token where ThinkingCap's wdot path takes 34ms. */
+/* Warp-cooperative iq4_xs: sub-block ib = lane/4, four qs bytes per
+ * lane (i = 4*(lane%4)), low nibbles pair with q8[32*ib + i], high with
+ * q8[32*ib + 16 + i], both under the sub-block's single 6-bit scale.
+ * Same codebook decode (iq4nl_lut4 + dp4a) as the per-lane dot; the
+ * win is one BLOCK split across the warp instead of one block per
+ * lane. No zero-tail guard: MatW contractions are 256-divisible by
+ * keep_native and quantize_q8_k zero-pads, so there is no overread. */
+struct wdot_iq4_xs {
+    struct Prep {
+        int32_t va, vb;
+        float dl;
+        uint32_t off; /* q8 byte offset of the va word */
+    };
+    __device__ __forceinline__ static Prep prepare(const char *row, uint32_t b, uint32_t lane) {
+        const block_iq4_xs *x = (const block_iq4_xs *)row + b;
+        const uint32_t ib = lane >> 2, i = (lane & 3u) << 2;
+        const int ls = (int)(((x->scales_l[ib >> 1] >> (4 * (ib & 1u))) & 0xfu) |
+                             (((x->scales_h >> (2 * ib)) & 3u) << 4)) - 32;
+        const uint32_t b4 = *(const uint32_t *)(x->qs + 16 * ib + i);
+        Prep p;
+        p.va = iq4nl_lut4(b4 & 0x0f0f0f0fu);
+        p.vb = iq4nl_lut4((b4 >> 4) & 0x0f0f0f0fu);
+        p.dl = f16_to_f32(x->d) * (float)ls;
+        p.off = 32 * ib + i;
+        return p;
+    }
+    __device__ __forceinline__ static float apply(const Prep &p, const block_q8_K *y, uint32_t b, uint32_t lane) {
+        (void)lane;
+        const block_q8_K *yb = y + b;
+        const int sa = __dp4a(p.va, *(const int32_t *)(yb->qs + p.off), 0);
+        const int sb = __dp4a(p.vb, *(const int32_t *)(yb->qs + p.off + 16), 0);
+        return p.dl * yb->d * (float)(sa + sb);
+    }
+    __device__ __forceinline__ static float block(const char *row, const block_q8_K *xq, uint32_t b, uint32_t lane) {
+        return apply(prepare(row, b, lane), xq, b, lane);
+    }
+};
+
+/* Warp-cooperative nvfp4: 32 lanes over a 256-value super-block = 4
+ * nvfp4 blocks (8 lanes each); a lane owns half a 16-value sub-block:
+ * one u32 of nibbles = 4 low values (q8 +0) and 4 high (q8 +8) under
+ * one UE4M3 sub-scale. 36-byte blocks keep everything 4-aligned when
+ * in_dim %% 256 == 0 (keep_native guarantees it). */
+struct wdot_nvfp4 {
+    struct Prep {
+        int32_t va, vb;
+        float dl;
+        uint32_t off; /* q8 byte offset of the va word */
+    };
+    __device__ __forceinline__ static Prep prepare(const char *row, uint32_t b, uint32_t lane) {
+        const uint32_t nb = lane >> 3, sub = (lane >> 1) & 3u, h = lane & 1u;
+        const char *bp = row + (uint64_t)b * 144u + (uint64_t)nb * 36u;
+        uint8_t e;
+        memcpy(&e, bp + sub, 1);
+        const uint32_t v = *(const uint32_t *)(bp + 4 + sub * 8 + h * 4);
+        Prep p;
+        p.va = mxfp4_lookup4(v & 0x0f0f0f0fu);
+        p.vb = mxfp4_lookup4((v >> 4) & 0x0f0f0f0fu);
+        p.dl = ue4m3_half(e);
+        p.off = nb * 64 + sub * 16 + h * 4;
+        return p;
+    }
+    __device__ __forceinline__ static float apply(const Prep &p, const block_q8_K *y, uint32_t b, uint32_t lane) {
+        (void)lane;
+        const block_q8_K *yb = y + b;
+        const int sa = __dp4a(p.va, *(const int32_t *)(yb->qs + p.off), 0);
+        const int sb = __dp4a(p.vb, *(const int32_t *)(yb->qs + p.off + 8), 0);
+        return p.dl * yb->d * (float)(sa + sb);
+    }
+    __device__ __forceinline__ static float block(const char *row, const block_q8_K *xq, uint32_t b, uint32_t lane) {
+        return apply(prepare(row, b, lane), xq, b, lane);
+    }
+};
+
+struct wdot_q5_K {
+    struct Prep {
+        uint32_t vlo, vhi;
+        float d, dmin;
+        int sc1, sc2, m1, m2;
+        uint32_t j, wi;
+    };
+    __device__ __forceinline__ static Prep prepare(const char *row, uint32_t b, uint32_t lane) {
+        const block_q5_K *x = (const block_q5_K *)row + b;
+        Prep p;
+        p.j = lane >> 3;
+        p.wi = (lane & 7u) << 2;
+        const uint32_t v = *(const uint32_t *)(x->qs + 32 * p.j + p.wi);
+        const uint32_t h = *(const uint32_t *)(x->qh + p.wi);
+        p.vlo = (v & 0x0f0f0f0fu) | (((h >> (2 * p.j)) & 0x01010101u) << 4);
+        p.vhi = ((v >> 4) & 0x0f0f0f0fu) | (((h >> (2 * p.j + 1)) & 0x01010101u) << 4);
+        p.d = f16_to_f32(x->d);
+        p.dmin = f16_to_f32(x->dmin);
+        uint8_t sc1, m1, sc2, m2;
+        k4_scale_min(2 * p.j, x->scales, &sc1, &m1);
+        k4_scale_min(2 * p.j + 1, x->scales, &sc2, &m2);
+        p.sc1 = sc1; p.m1 = m1; p.sc2 = sc2; p.m2 = m2;
+        return p;
+    }
+    __device__ __forceinline__ static float apply(const Prep &p, const block_q8_K *y, uint32_t b, uint32_t lane) {
+        const block_q8_K *yb = y + b;
+        const int8_t *q8 = yb->qs + 64 * p.j;
+        const int s1 = __dp4a((int)p.vlo, *(const int32_t *)(q8 + p.wi), 0);
+        const int s2 = __dp4a((int)p.vhi, *(const int32_t *)(q8 + 32 + p.wi), 0);
+        float acc = p.d * yb->d * (float)(p.sc1 * s1 + p.sc2 * s2);
+        if ((lane & 7u) == 0) {
+            acc -= p.dmin * yb->d *
+                   (float)(p.m1 * (yb->bsums[4 * p.j] + yb->bsums[4 * p.j + 1]) +
+                           p.m2 * (yb->bsums[4 * p.j + 2] + yb->bsums[4 * p.j + 3]));
+        }
+        return acc;
+    }
+    __device__ __forceinline__ static float block(const char *row, const block_q8_K *xq, uint32_t b, uint32_t lane) {
+        return apply(prepare(row, b, lane), xq, b, lane);
+    }
+};
+
 struct dot_q6_K {
     __device__ __forceinline__ static float block(const char *row, const block_q8_K *xq, uint32_t b) {
         return dev_dot_q6_K_q8_K_block((const block_q6_K *)row + b, xq + b);
@@ -2287,6 +2486,7 @@ enum {
     PULSAR_QUANT_IQ3_S = 14,
     PULSAR_QUANT_IQ2_S = 15,
     PULSAR_QUANT_IQ1_S = 16,
+    PULSAR_QUANT_NVFP4 = 17,
 };
 
 /* ---- grouped batch MoE: amortize weight reads across the prefill batch.
@@ -3066,6 +3266,7 @@ __global__ static void moe_grouped_mma_kernel(
         case PULSAR_QUANT_Q8_0:    kern<dot_q8_0><<<grid, block, shmem>>>(__VA_ARGS__); break; \
         case PULSAR_QUANT_IQ4_XS:  kern<dot_iq4_xs><<<grid, block, shmem>>>(__VA_ARGS__); break; \
         case PULSAR_QUANT_MXFP4:   kern<dot_mxfp4><<<grid, block, shmem>>>(__VA_ARGS__); break; \
+        case PULSAR_QUANT_NVFP4:   kern<dot_nvfp4><<<grid, block, shmem>>>(__VA_ARGS__); break; \
         case PULSAR_QUANT_IQ4_NL:  kern<dot_iq4_nl><<<grid, block, shmem>>>(__VA_ARGS__); break; \
         case PULSAR_QUANT_IQ3_S:   kern<dot_iq3_s><<<grid, block, shmem>>>(__VA_ARGS__); break; \
         case PULSAR_QUANT_IQ2_S:   kern<dot_iq2_s><<<grid, block, shmem>>>(__VA_ARGS__); break; \
@@ -3430,7 +3631,9 @@ extern "C" int pulsar_matmul_kq(
          * loads, not on occupancy - ncu: L1 94%, DRAM 28%, 56 regs */
         switch (quant) {
         case PULSAR_QUANT_Q4_K: PULSAR_KQW_T(wdot_q4_K);
+        case PULSAR_QUANT_Q5_K: PULSAR_KQW_T(wdot_q5_K);
         case PULSAR_QUANT_Q6_K: PULSAR_KQW_T(wdot_q6_K);
+case PULSAR_QUANT_IQ4_XS: PULSAR_KQW_T(wdot_iq4_xs);
         default: break;
         }
         #undef PULSAR_KQW_T
@@ -3452,6 +3655,11 @@ extern "C" int pulsar_matmul_kq(
         PULSAR_KQ16(PULSAR_QUANT_Q5_K, dot_q5_K);
         PULSAR_KQ16(PULSAR_QUANT_Q6_K, dot_q6_K);
         PULSAR_KQ16(PULSAR_QUANT_Q3_K, dot_q3_K);
+        /* unsloth UD dense ggufs mix IQ4 into the K-quant stack
+         * (Qwen3.8-27B UD-Q4_K_XL ships ffn_gate as IQ4_XS) */
+        PULSAR_KQ16(PULSAR_QUANT_IQ4_XS, dot_iq4_xs);
+        PULSAR_KQ16(PULSAR_QUANT_IQ4_NL, dot_iq4_nl);
+        PULSAR_KQ16(PULSAR_QUANT_NVFP4, dot_nvfp4);
 #undef PULSAR_KQ16
         default: return 0;
         }
@@ -3468,13 +3676,22 @@ extern "C" int pulsar_matmul_kq(
         matmul_kqw_kernel<wdot_q4_K><<<grid, block>>>((float *)out_dev, (const char *)w_dev, (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes);
         break;
     case PULSAR_QUANT_Q5_K:
-        matmul_kq_kernel<dot_q5_K><<<grid, block>>>((float *)out_dev, (const char *)w_dev, (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes);
+        matmul_kqw_kernel<wdot_q5_K><<<grid, block>>>((float *)out_dev, (const char *)w_dev, (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes);
         break;
     case PULSAR_QUANT_Q6_K:
         matmul_kqw_kernel<wdot_q6_K><<<grid, block>>>((float *)out_dev, (const char *)w_dev, (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes);
         break;
     case PULSAR_QUANT_Q3_K:
         matmul_kq_kernel<dot_q3_K><<<grid, block>>>((float *)out_dev, (const char *)w_dev, (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes);
+        break;
+    case PULSAR_QUANT_IQ4_XS:
+        matmul_kqw_kernel<wdot_iq4_xs><<<grid, block>>>((float *)out_dev, (const char *)w_dev, (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes);
+        break;
+    case PULSAR_QUANT_IQ4_NL:
+        matmul_kq_kernel<dot_iq4_nl><<<grid, block>>>((float *)out_dev, (const char *)w_dev, (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes);
+        break;
+    case PULSAR_QUANT_NVFP4:
+        matmul_kqw_kernel<wdot_nvfp4><<<grid, block>>>((float *)out_dev, (const char *)w_dev, (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes);
         break;
     default:
         return 0;
@@ -3610,6 +3827,12 @@ extern "C" int pulsar_moe_pair_swiglu(
                 (const float *)weights_dev, (const block_q8_K *)xq_dev,
                 in_blocks, mid_dim, n_used, n_tok, row_bytes, act_op);
         break;
+    case PULSAR_QUANT_NVFP4:
+        moe_pair_swiglu_kernel<dot_nvfp4><<<grid, block>>>(
+                (float *)mid_dev, (const pulsar_expert_ptrs *)ptrs_dev,
+                (const float *)weights_dev, (const block_q8_K *)xq_dev,
+                in_blocks, mid_dim, n_used, n_tok, row_bytes, act_op);
+        break;
     default:
         return 0;
     }
@@ -3735,6 +3958,12 @@ extern "C" int pulsar_moe_down(
         break;
     case PULSAR_QUANT_MXFP4:
         moe_down_kernel<dot_mxfp4><<<grid, block>>>(
+                (float *)out_dev, (const pulsar_expert_ptrs *)ptrs_dev,
+                (const block_q8_K *)midq_dev, mid_blocks, out_dim, n_used,
+                n_tok, row_bytes);
+        break;
+    case PULSAR_QUANT_NVFP4:
+        moe_down_kernel<dot_nvfp4><<<grid, block>>>(
                 (float *)out_dev, (const pulsar_expert_ptrs *)ptrs_dev,
                 (const block_q8_K *)midq_dev, mid_blocks, out_dim, n_used,
                 n_tok, row_bytes);
@@ -4057,6 +4286,36 @@ static float host_dot_mxfp4_block(const char *row, const block_q8_K *xq, uint32_
             if (e >= 2) {
                 const uint32_t bits = (uint32_t)(e - 1) << 23;
                 memcpy(&d, &bits, 4);
+            }
+            sumf += d * (float)sumi;
+        }
+    }
+    return y->d * sumf;
+}
+
+static float host_dot_nvfp4_block(const char *row, const block_q8_K *xq, uint32_t bi) {
+    const char *base = row + (uint64_t)bi * 144u;
+    const block_q8_K *y = xq + bi;
+    const int8_t *q8 = y->qs;
+    static const int kv[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+    float sumf = 0.0f;
+    for (int b = 0; b < 4; b++) {
+        const char *bp = base + (uint64_t)b * 36u;
+        for (int sub = 0; sub < 4; sub++) {
+            const unsigned char e = (unsigned char)bp[sub];
+            int sumi = 0;
+            for (int i = 0; i < 8; i++) {
+                const unsigned char q = (unsigned char)bp[4 + sub * 8 + i];
+                sumi += kv[q & 0x0f] * (int)q8[b * 64 + sub * 16 + i];
+                sumi += kv[q >> 4] * (int)q8[b * 64 + sub * 16 + 8 + i];
+            }
+            /* ggml_ue4m3_to_fp32 verbatim (0 and 0x7F are zero) */
+            float d = 0.0f;
+            if (e != 0 && e != 0x7F) {
+                const int ex = (e >> 3) & 0xF;
+                const int man = e & 7;
+                d = (ex == 0 ? ldexpf((float)man, -9)
+                             : ldexpf(1.0f + (float)man / 8.0f, ex - 7)) * 0.5f;
             }
             sumf += d * (float)sumi;
         }
@@ -4458,6 +4717,7 @@ static int moe_selftest_one2(uint32_t quant, const char *name, uint32_t mid_dim)
     case PULSAR_QUANT_Q8_0:   block_bytes = 8 * sizeof(q8_0_block); dot = host_dot_q8_0_block;   break;
     case PULSAR_QUANT_IQ4_XS: block_bytes = sizeof(block_iq4_xs);   dot = host_dot_iq4_xs_block; break;
     case PULSAR_QUANT_MXFP4:  block_bytes = 8 * sizeof(block_mxfp4); dot = host_dot_mxfp4_block; break;
+    case PULSAR_QUANT_NVFP4:  block_bytes = 144; dot = host_dot_nvfp4_block; break;
     case PULSAR_QUANT_IQ4_NL: block_bytes = 8 * sizeof(block_iq4_nl); dot = host_dot_iq4_nl_block; break;
     case PULSAR_QUANT_IQ3_S:  block_bytes = sizeof(block_iq3_s);      dot = host_dot_iq3_s_block; break;
     case PULSAR_QUANT_IQ2_S:  block_bytes = sizeof(block_iq2_s);      dot = host_dot_iq2_s_block; break;
@@ -4738,6 +4998,7 @@ extern "C" int pulsar_moe_selftest(void) {
            moe_selftest_one(PULSAR_QUANT_Q8_0, "q8_0") &&
            moe_selftest_one(PULSAR_QUANT_IQ4_XS, "iq4_xs") &&
            moe_selftest_one(PULSAR_QUANT_MXFP4, "mxfp4") &&
+           moe_selftest_one(PULSAR_QUANT_NVFP4, "nvfp4") &&
            moe_selftest_one(PULSAR_QUANT_IQ4_NL, "iq4_nl") &&
            moe_selftest_one(PULSAR_QUANT_IQ3_S, "iq3_s") &&
            moe_selftest_one(PULSAR_QUANT_IQ2_S, "iq2_s") &&
@@ -4747,6 +5008,7 @@ extern "C" int pulsar_moe_selftest(void) {
            moe_selftest_one2(PULSAR_QUANT_Q8_0, "q8_0-704", 704) &&
            moe_selftest_one2(PULSAR_QUANT_IQ4_XS, "iq4_xs-704", 704) &&
            moe_selftest_one2(PULSAR_QUANT_MXFP4, "mxfp4-704", 704) &&
+           moe_selftest_one2(PULSAR_QUANT_NVFP4, "nvfp4-704", 704) &&
            moe_selftest_one2(PULSAR_QUANT_IQ4_NL, "iq4_nl-704", 704) &&
            moe_selftest_one2(PULSAR_QUANT_IQ3_S, "iq3_s-704", 704) &&
            moe_selftest_one2(PULSAR_QUANT_IQ2_S, "iq2_s-704", 704) &&
@@ -5401,6 +5663,87 @@ extern "C" int pulsar_gqa_attention(
                                          n_kv_head, head_dim, cap, pos0, scale,
                                          window, rpt, rel_extent, spt);
     }
+}
+
+extern "C" int pulsar_gqa_rope_dev(
+        void *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim,
+        uint32_t rot_dim, const void *pos_dev, float theta) {
+    ds4_gpu_tensor xt = shim(x);
+    return ds4_gpu_gqa_rope_dev(&xt, n_tok, n_head, head_dim, rot_dim, pos_dev, theta);
+}
+
+extern "C" int pulsar_gqa_kv_append_dev(
+        void *cache, const void *kv, uint32_t n_tok, uint32_t n_kv_head,
+        uint32_t head_dim, uint32_t cap, const void *pos_dev) {
+    ds4_gpu_tensor ct = shim(cache), kt = shim(kv);
+    return ds4_gpu_gqa_kv_cache_append_dev(&ct, &kt, n_tok, n_kv_head, head_dim, cap, pos_dev);
+}
+
+extern "C" int pulsar_gqa_attention_dev(
+        void *out, const void *q, const void *k_cache, const void *v_cache,
+        uint32_t n_tok, uint32_t n_head, uint32_t n_kv_head,
+        uint32_t head_dim, uint32_t cap, const void *pos_dev, float scale) {
+    ds4_gpu_tensor ot = shim(out), qt = shim(q), kt = shim(k_cache), vt = shim(v_cache);
+    return ds4_gpu_gqa_attention_dev(&ot, &qt, &kt, &vt, n_tok, n_head,
+                                     n_kv_head, head_dim, cap, pos_dev, scale);
+}
+
+/* Row-wise argmax: one block per row, 256 threads scan the row strided
+ * and reduce (value, index) in shared memory. First index wins ties,
+ * matching the host scan the spec loop used. Turns per-round megabyte
+ * logits readbacks into 4 bytes per row. */
+__global__ static void argmax_rows_kernel(
+        void *out, const float *x, uint32_t n, uint32_t rows) {
+    const uint32_t row = blockIdx.x;
+    if (row >= rows) return;
+    const float *xr = x + (uint64_t)row * n;
+    float best = -INFINITY;
+    uint32_t bi = 0;
+    for (uint32_t i = threadIdx.x; i < n; i += 256u) {
+        const float v = xr[i];
+        if (v > best || (v == best && i < bi)) { best = v; bi = i; }
+    }
+    __shared__ float sv[256];
+    __shared__ uint32_t si[256];
+    sv[threadIdx.x] = best;
+    si[threadIdx.x] = bi;
+    __syncthreads();
+    for (uint32_t st = 128u; st != 0; st >>= 1u) {
+        if (threadIdx.x < st) {
+            const float ov = sv[threadIdx.x + st];
+            const uint32_t oi = si[threadIdx.x + st];
+            if (ov > sv[threadIdx.x] ||
+                (ov == sv[threadIdx.x] && oi < si[threadIdx.x])) {
+                sv[threadIdx.x] = ov;
+                si[threadIdx.x] = oi;
+            }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        /* (value, index) pair per row: a vocab-split head compares the
+         * halves' maxima host-side exactly like one full scan would */
+        float *op = (float *)out + (uint64_t)row * 2u;
+        op[0] = sv[0];
+        memcpy(op + 1, &si[0], 4);
+    }
+}
+
+extern "C" int pulsar_argmax_rows(
+        void *out, const void *x, uint32_t n, uint32_t rows) {
+    if (n == 0 || rows == 0) return 0;
+    argmax_rows_kernel<<<rows, 256>>>((int32_t *)out, (const float *)x, n, rows);
+    return cuda_ok(cudaGetLastError(), "argmax_rows launch");
+}
+
+/* one-thread device write: the per-token position cells the graph-
+ * captured kernels dereference (a host H2D would sync; this launches
+ * async on the per-thread stream, correctly ordered before the graph) */
+__global__ static void set_u32_kernel(uint32_t *dst, uint32_t v) { *dst = v; }
+
+extern "C" int pulsar_set_u32(void *dst, uint32_t v) {
+    set_u32_kernel<<<1, 1>>>((uint32_t *)dst, v);
+    return cuda_ok(cudaGetLastError(), "set_u32 launch");
 }
 
 extern "C" int pulsar_gqa_selftest(void) { return ds4_gpu_gqa_selftest(); }
