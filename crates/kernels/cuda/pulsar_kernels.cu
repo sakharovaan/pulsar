@@ -3525,12 +3525,33 @@ __global__ static void matmul_kqw_tokens_kernel(
         uint64_t row_bytes) {
     const uint32_t lane = threadIdx.x;
     const uint32_t row = blockIdx.x * blockDim.y + threadIdx.y;
-    if (row >= out_dim) return;
-    const char *wr = w + (uint64_t)row * row_bytes;
+    /* NO early return: the staging loop below has __syncthreads(), so
+     * every thread of the block must reach it. Rows past out_dim clamp
+     * their weight pointer (read is harmless) and skip only the store. */
+    const bool live = row < out_dim;
+    const char *wr = w + (uint64_t)(live ? row : out_dim - 1u) * row_bytes;
+
+    /* The 4 row-warps of a block all dot against the SAME activation
+     * blocks, so reading them from global per warp burns 4x the L1
+     * traffic - and ncu had this kernel at L1 94% / DRAM 28%, i.e.
+     * bound on exactly those loads. Stage the tile's q8 blocks in
+     * shared once per weight block; all warps then read them from
+     * smem and the L1 path is left to the weight rows. */
+    constexpr uint32_t QW = sizeof(block_q8_K) / 4u;
+    __shared__ uint32_t xs[TT * QW];
+    const uint32_t tid = threadIdx.y * blockDim.x + lane;
+    const uint32_t nthr = blockDim.y * blockDim.x;
+
     float acc[TT];
     #pragma unroll
     for (int t = 0; t < TT; t++) acc[t] = 0.0f;
     for (uint32_t b = 0; b < in_blocks; b++) {
+        const uint32_t total = n_tok * QW;
+        for (uint32_t i = tid; i < total; i += nthr) {
+            const uint32_t t = i / QW;
+            xs[i] = ((const uint32_t *)(xq + (uint64_t)t * in_blocks + b))[i - t * QW];
+        }
+        __syncthreads();
         /* decode the weight word once; only the dp4a runs per token.
          * Compile-time unroll with an early exit keeps acc[] in
          * registers - a runtime trip count spills it to local memory. */
@@ -3538,8 +3559,9 @@ __global__ static void matmul_kqw_tokens_kernel(
         #pragma unroll
         for (int t = 0; t < TT; t++) {
             if ((uint32_t)t >= n_tok) break;
-            acc[t] += WDOT::apply(p, xq + (uint64_t)t * in_blocks, b, lane);
+            acc[t] += WDOT::apply(p, (const block_q8_K *)xs + t, 0u, lane);
         }
+        __syncthreads();
     }
     #pragma unroll
     for (int t = 0; t < TT; t++) {
@@ -3549,7 +3571,7 @@ __global__ static void matmul_kqw_tokens_kernel(
         for (uint32_t mask = 16u; mask > 0u; mask >>= 1u) {
             a += __shfl_xor_sync(0xffffffffu, a, mask);
         }
-        if (lane == 0) out[(uint64_t)t * out_dim + row] = a;
+        if (lane == 0 && live) out[(uint64_t)t * out_dim + row] = a;
     }
 }
 
@@ -3589,6 +3611,417 @@ __global__ static void matmul_kq_tokens_kernel(
     }
 }
 
+
+/* ---- prefill GEMM ------------------------------------------------------
+ * The register-tiled kernel above tops out at 16 tokens per weight read
+ * (acc[] spills past that, measured), which leaves prefill sweeping the
+ * full weight matrix once per 16 tokens - memory-bound at ~28% of DRAM
+ * and ~6% of the integer pipe. This is the MMQ-shaped fix: a block
+ * dequantizes a 32-row weight tile into shared memory ONCE, stages the
+ * 64-token activation tile next to it, and each thread accumulates
+ * 8 rows x 1 token over dp4a. Weights stream once per 64 tokens and the
+ * inner loop runs register-to-register.
+ *
+ * For streamed (host/SSD-tier) models the same reuse factor divides the
+ * PCIe/SSD traffic, which is the whole ballgame there.
+ *
+ * q4_K only for now; other quants fall through to the grouped path.
+ * ponytail: BN=64 and dp4a; wider tiles + int8 MMA are the next rungs. */
+#define PULSAR_GEMM_BM 32u
+#define PULSAR_GEMM_BN 64u
+#define PULSAR_GEMM_WS 260u /* padded int8 row stride: breaks smem bank conflicts */
+#define PULSAR_GEMM_YS 260u
+
+__global__ static void matmul_kq_gemm_q4K(
+        float *out,
+        const char *w,
+        const block_q8_K *xq,
+        uint32_t in_blocks,
+        uint32_t out_dim,
+        uint32_t n_tok,
+        uint64_t row_bytes) {
+    __shared__ int8_t wq_s[PULSAR_GEMM_BM * PULSAR_GEMM_WS];
+    __shared__ int8_t yq_s[PULSAR_GEMM_BN * PULSAR_GEMM_YS];
+    __shared__ float wsc_s[PULSAR_GEMM_BM][8];
+    __shared__ float wmin_s[PULSAR_GEMM_BM][8];
+    __shared__ float yd_s[PULSAR_GEMM_BN];
+    __shared__ float ybs_s[PULSAR_GEMM_BN][8];
+
+    const uint32_t tx = threadIdx.x;      /* token lane, 0..63 */
+    const uint32_t ty = threadIdx.y;      /* row group, 0..3 */
+    const uint32_t tid = ty * 64u + tx;
+    const uint32_t row0 = blockIdx.x * PULSAR_GEMM_BM;
+    const uint32_t tok0 = blockIdx.y * PULSAR_GEMM_BN;
+    const uint32_t tok = tok0 + tx;
+
+    float acc[8];
+    #pragma unroll
+    for (int r = 0; r < 8; r++) acc[r] = 0.0f;
+
+    for (uint32_t b = 0; b < in_blocks; b++) {
+        /* stage the weight tile: 8 threads per row expand the 4-bit qs
+         * to int8 (same nibble->value order the wdot path uses: chunk c
+         * low nibbles are values 64c+i, high nibbles 64c+32+i) */
+        {
+            const uint32_t r = tid >> 3;
+            const uint32_t j = tid & 7u;
+            const uint32_t rg = row0 + r < out_dim ? row0 + r : out_dim - 1u;
+            const block_q4_K *xb = (const block_q4_K *)(w + (uint64_t)rg * row_bytes) + b;
+            const uint32_t c = j >> 1, h = j & 1u;
+            const uint8_t *src = xb->qs + 32u * c + 16u * h;
+            int8_t *dlo = wq_s + r * PULSAR_GEMM_WS + 64u * c + 16u * h;
+            #pragma unroll
+            for (int i = 0; i < 16; i += 4) {
+                const uint32_t v = *(const uint32_t *)(src + i);
+                *(uint32_t *)(dlo + i) = v & 0x0f0f0f0fu;
+                *(uint32_t *)(dlo + 32 + i) = (v >> 4) & 0x0f0f0f0fu;
+            }
+            /* 32-value group j's scale/min, premultiplied by d/dmin */
+            uint8_t sc, mn;
+            k4_scale_min((int)j, xb->scales, &sc, &mn);
+            wsc_s[r][j] = f16_to_f32(xb->d) * (float)sc;
+            wmin_s[r][j] = f16_to_f32(xb->dmin) * (float)mn;
+        }
+        /* stage the activation tile: 4 threads per token copy the q8 block */
+        {
+            const uint32_t t = tid >> 2;
+            const uint32_t q = tid & 3u;
+            const uint32_t tg = tok0 + t < n_tok ? tok0 + t : n_tok - 1u;
+            const block_q8_K *yb = xq + (uint64_t)tg * in_blocks + b;
+            const uint8_t *src = (const uint8_t *)yb->qs + 64u * q;
+            int8_t *dst = yq_s + t * PULSAR_GEMM_YS + 64u * q;
+            #pragma unroll
+            for (int i = 0; i < 64; i += 4)
+                *(uint32_t *)(dst + i) = *(const uint32_t *)(src + i);
+            if (q == 0u) yd_s[t] = yb->d;
+        }
+        for (uint32_t sl = tid; sl < PULSAR_GEMM_BN * 8u; sl += 256u) {
+            const uint32_t t = sl >> 3, g = sl & 7u;
+            const uint32_t tg = tok0 + t < n_tok ? tok0 + t : n_tok - 1u;
+            const block_q8_K *yb = xq + (uint64_t)tg * in_blocks + b;
+            ybs_s[t][g] = (float)(yb->bsums[2u * g] + yb->bsums[2u * g + 1u]);
+        }
+        __syncthreads();
+
+        /* compute: token tx against rows ty*8..ty*8+7. y words load once
+         * per group and serve all 8 rows from registers; the weight and
+         * scale reads are warp-uniform (broadcast, no bank conflicts). */
+        const int8_t *yrow = yq_s + tx * PULSAR_GEMM_YS;
+        const float ydv = yd_s[tx];
+        #pragma unroll
+        for (uint32_t g = 0; g < 8u; g++) {
+            int yw[8];
+            #pragma unroll
+            for (int i = 0; i < 8; i++)
+                yw[i] = *(const int32_t *)(yrow + 32u * g + 4u * i);
+            const float bsg = ybs_s[tx][g];
+            #pragma unroll
+            for (int r = 0; r < 8; r++) {
+                const uint32_t rl = ty * 8u + r;
+                const int8_t *wr_ = wq_s + rl * PULSAR_GEMM_WS + 32u * g;
+                int sg = 0;
+                #pragma unroll
+                for (int i = 0; i < 8; i++)
+                    sg = __dp4a(*(const int32_t *)(wr_ + 4 * i), yw[i], sg);
+                acc[r] += ydv * (wsc_s[rl][g] * (float)sg - wmin_s[rl][g] * bsg);
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tok < n_tok) {
+        #pragma unroll
+        for (int r = 0; r < 8; r++) {
+            const uint32_t rg = row0 + ty * 8u + r;
+            if (rg < out_dim) out[(uint64_t)tok * out_dim + rg] = acc[r];
+        }
+    }
+}
+
+
+/* q6_K flavor of the prefill GEMM. Same frame as q4K above; the block
+ * dequantizes to (q - 32) int8 so the offset folds into the values and
+ * no bsum term is needed, and scales run per 16 values (scales[v>>4]).
+ * q6_K blocks are 210 bytes - rows are only 2-aligned, so the quant
+ * bytes go through load_u32_bytes like wdot_q6_K does. */
+__global__ static void matmul_kq_gemm_q6K(
+        float *out,
+        const char *w,
+        const block_q8_K *xq,
+        uint32_t in_blocks,
+        uint32_t out_dim,
+        uint32_t n_tok,
+        uint64_t row_bytes) {
+    __shared__ int8_t wq_s[PULSAR_GEMM_BM * PULSAR_GEMM_WS];
+    __shared__ int8_t yq_s[PULSAR_GEMM_BN * PULSAR_GEMM_YS];
+    __shared__ float wsc_s[PULSAR_GEMM_BM][16];
+    __shared__ float yd_s[PULSAR_GEMM_BN];
+
+    const uint32_t tx = threadIdx.x;
+    const uint32_t ty = threadIdx.y;
+    const uint32_t tid = ty * 64u + tx;
+    const uint32_t row0 = blockIdx.x * PULSAR_GEMM_BM;
+    const uint32_t tok0 = blockIdx.y * PULSAR_GEMM_BN;
+    const uint32_t tok = tok0 + tx;
+
+    float acc[8];
+    #pragma unroll
+    for (int r = 0; r < 8; r++) acc[r] = 0.0f;
+
+    for (uint32_t b = 0; b < in_blocks; b++) {
+        {
+            const uint32_t r = tid >> 3;
+            const uint32_t j5 = tid & 7u;
+            const uint32_t rg = row0 + r < out_dim ? row0 + r : out_dim - 1u;
+            const block_q6_K *xb = (const block_q6_K *)(w + (uint64_t)rg * row_bytes) + b;
+            /* thread j5 -> (chunk j of 128, hi nibble, 16-value half) */
+            const uint32_t j = j5 >> 2, hi = (j5 >> 1) & 1u, ib = (j5 & 1u) << 4;
+            const uint8_t *ql = xb->ql + 64u * j;
+            int8_t *dst = wq_s + r * PULSAR_GEMM_WS + 128u * j + 64u * hi + ib;
+            #pragma unroll
+            for (int i = 0; i < 16; i += 4) {
+                const uint32_t lo0 = load_u32_bytes(ql + ib + i);
+                const uint32_t lo1 = load_u32_bytes(ql + 32u + ib + i);
+                const uint32_t h = load_u32_bytes(xb->qh + 32u * j + ib + i);
+                uint32_t va, vb;
+                if (hi == 0u) {
+                    va = (lo0 & 0x0f0f0f0fu) | (((h >> 0) & 0x03030303u) << 4);
+                    vb = (lo1 & 0x0f0f0f0fu) | (((h >> 2) & 0x03030303u) << 4);
+                } else {
+                    va = ((lo0 >> 4) & 0x0f0f0f0fu) | (((h >> 4) & 0x03030303u) << 4);
+                    vb = ((lo1 >> 4) & 0x0f0f0f0fu) | (((h >> 6) & 0x03030303u) << 4);
+                }
+                *(uint32_t *)(dst + i) = (uint32_t)__vsub4((int)va, 0x20202020);
+                *(uint32_t *)(dst + 32 + i) = (uint32_t)__vsub4((int)vb, 0x20202020);
+            }
+            /* this thread's two 16-value runs sit at scale slots k0, k0+2 */
+            const uint32_t k0 = (128u * j + 64u * hi + ib) >> 4;
+            const float d = f16_to_f32(xb->d);
+            wsc_s[r][k0] = d * (float)xb->scales[k0];
+            wsc_s[r][k0 + 2u] = d * (float)xb->scales[k0 + 2u];
+        }
+        {
+            const uint32_t t = tid >> 2;
+            const uint32_t q = tid & 3u;
+            const uint32_t tg = tok0 + t < n_tok ? tok0 + t : n_tok - 1u;
+            const block_q8_K *yb = xq + (uint64_t)tg * in_blocks + b;
+            const uint8_t *src = (const uint8_t *)yb->qs + 64u * q;
+            int8_t *dst = yq_s + t * PULSAR_GEMM_YS + 64u * q;
+            #pragma unroll
+            for (int i = 0; i < 64; i += 4)
+                *(uint32_t *)(dst + i) = *(const uint32_t *)(src + i);
+            if (q == 0u) yd_s[t] = yb->d;
+        }
+        __syncthreads();
+
+        const int8_t *yrow = yq_s + tx * PULSAR_GEMM_YS;
+        const float ydv = yd_s[tx];
+        #pragma unroll
+        for (uint32_t k = 0; k < 16u; k++) {
+            int yw[4];
+            #pragma unroll
+            for (int i = 0; i < 4; i++)
+                yw[i] = *(const int32_t *)(yrow + 16u * k + 4u * i);
+            #pragma unroll
+            for (int r = 0; r < 8; r++) {
+                const uint32_t rl = ty * 8u + r;
+                const int8_t *wr_ = wq_s + rl * PULSAR_GEMM_WS + 16u * k;
+                int sg = 0;
+                #pragma unroll
+                for (int i = 0; i < 4; i++)
+                    sg = __dp4a(*(const int32_t *)(wr_ + 4 * i), yw[i], sg);
+                acc[r] += ydv * wsc_s[rl][k] * (float)sg;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tok < n_tok) {
+        #pragma unroll
+        for (int r = 0; r < 8; r++) {
+            const uint32_t rg = row0 + ty * 8u + r;
+            if (rg < out_dim) out[(uint64_t)tok * out_dim + rg] = acc[r];
+        }
+    }
+}
+
+
+/* tensor-core flavor of the prefill GEMM (sm_80+). Reuses the MoE MMA
+ * machinery - the UNPACK::chunk16 dequant policies and the m16n8k16
+ * fragment mapping - minus the pair/gather bookkeeping: B columns are
+ * just consecutive tokens. A block stages a 16-row weight tile in smem;
+ * each of its 8 warps owns one 8-token column tile, so a block covers
+ * 16 rows x 64 tokens. B rides L1/L2 straight from the q8_K rows, same
+ * as the MoE kernel. */
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+__device__ __forceinline__ static void ldmatrix_x4(
+        uint32_t f[4], const void *smem_row) {
+    const uint32_t sa = (uint32_t)__cvta_generic_to_shared(smem_row);
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+        : "=r"(f[0]), "=r"(f[1]), "=r"(f[2]), "=r"(f[3])
+        : "r"(sa));
+}
+__device__ __forceinline__ static float f4_at(const float4 &f, uint32_t i) {
+    return i == 0u ? f.x : i == 1u ? f.y : i == 2u ? f.z : f.w;
+}
+__device__ __forceinline__ static void ldmatrix_x2(
+        uint32_t f[2], const void *smem_row) {
+    const uint32_t sa = (uint32_t)__cvta_generic_to_shared(smem_row);
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];"
+        : "=r"(f[0]), "=r"(f[1]) : "r"(sa));
+}
+#endif
+
+/* a_s rows pad to 272 so ldmatrix's 32 row addresses spread over the
+ * banks (256 would land every row on bank 0) */
+#define PULSAR_GEMM_AS 272u
+
+template <typename UNPACK>
+__global__ static void matmul_kq_gemm_mma_kernel(
+        float *out,
+        const char *w,
+        const block_q8_K *xq,
+        uint32_t in_blocks,
+        uint32_t out_dim,
+        uint32_t n_tok,
+        uint64_t row_bytes) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    const uint32_t r0 = blockIdx.x * 32u;
+    const uint32_t tok0 = blockIdx.y * 64u;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u; /* 0..7: which token octet */
+    const uint32_t g = lane >> 2u;           /* fragment row / B column */
+    const uint32_t tg = lane & 3u;           /* K quad / D column pair */
+
+    /* 32-row tile (a 16-row diet halved B reuse and lost: 14.9s vs
+     * 12.6s - B global loads are the top stall, do not double them),
+     * double-buffered: registers cap occupancy at 3 blocks/SM anyway,
+     * so the second buffer is free smem; staging sb+1 overlaps the
+     * mma of sb and the loop runs ONE barrier per superblock. */
+    __shared__ int8_t a_s[2][32][PULSAR_GEMM_AS];
+    __shared__ float s_w[2][32][16];
+    /* [2] planes unconditionally, matching the MoE kernel: HAS_MIN
+     * false leaves them unwritten dead weight, never UB */
+    __shared__ float s_m[2][32][16];
+
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+    const uint32_t tb = tok0 + warp * 8u;
+    const uint32_t t_b = tb + g;
+    const uint32_t t_c0 = tb + tg * 2u;
+    const uint32_t t_c1 = tb + tg * 2u + 1u;
+    /* clamped, not NULL: b rides an always-valid row so the inner loop
+     * carries no guard; out-of-range tokens only skip the store. B
+     * stays in global on purpose: an smem-staged y tile + ldmatrix B
+     * fragments measured SLOWER (12.98s vs 12.67s) - the token rows
+     * are re-read by every grid.x block and sit hot in L1. */
+    const char *yb = (const char *)(xq + (uint64_t)(t_b < n_tok ? t_b : n_tok - 1u) * in_blocks);
+    const char *yc0 = t_c0 < n_tok ? (const char *)(xq + (uint64_t)t_c0 * in_blocks) : NULL;
+    const char *yc1 = t_c1 < n_tok ? (const char *)(xq + (uint64_t)t_c1 * in_blocks) : NULL;
+
+    /* two (row, chunk) slots per thread per stage */
+    const uint32_t sc_i = threadIdx.x & 15u;
+
+#define PULSAR_GEMM_STAGE(buf, sb)                                             \
+    do {                                                                       \
+        for (uint32_t r = threadIdx.x >> 4u; r < 32u; r += 16u) {              \
+            const uint32_t rg = r0 + r < out_dim ? r0 + r : out_dim - 1u;      \
+            int32_t w4[4] = {0, 0, 0, 0};                                      \
+            float sc = 0.0f, mo = 0.0f;                                        \
+            UNPACK::chunk16(w + (uint64_t)rg * row_bytes                       \
+                                    + (uint64_t)(sb) * UNPACK::SB_BYTES,       \
+                            sc_i, w4, &sc, &mo);                               \
+            *(int4 *)&a_s[buf][r][sc_i * 16u] = *(const int4 *)w4;             \
+            s_w[buf][r][sc_i] = sc;                                            \
+            if (UNPACK::HAS_MIN) s_m[buf][r][sc_i] = mo;                       \
+        }                                                                      \
+    } while (0)
+
+    PULSAR_GEMM_STAGE(0u, 0u);
+    __syncthreads();
+
+    for (uint32_t sb = 0; sb < in_blocks; sb++) {
+        const uint32_t cur = sb & 1u;
+        if (sb + 1u < in_blocks) PULSAR_GEMM_STAGE(cur ^ 1u, sb + 1u);
+
+        const char *ybs = yb + (uint64_t)sb * sizeof(block_q8_K);
+        const char *yc0s = yc0 ? yc0 + (uint64_t)sb * sizeof(block_q8_K) : NULL;
+        const char *yc1s = yc1 ? yc1 + (uint64_t)sb * sizeof(block_q8_K) : NULL;
+        const float d0 = yc0s ? ((const block_q8_K *)yc0s)->d : 0.0f;
+        const float d1 = yc1s ? ((const block_q8_K *)yc1s)->d : 0.0f;
+
+        /* ncu: MIO-queue stalls were 35% of warp wait when this loop
+         * was narrow 32-bit smem loads. Scales come 4 chunks per
+         * float4; the A fragments of BOTH 16-row tiles arrive in one
+         * ldmatrix.x4 per chunk (lane i supplies row i; rows pad to
+         * 272 to spread the banks). */
+        #pragma unroll
+        for (uint32_t ch4 = 0; ch4 < 4u; ch4++) {
+            const float4 sw0 = *(const float4 *)&s_w[cur][g][ch4 * 4u];
+            const float4 sw8 = *(const float4 *)&s_w[cur][g + 8u][ch4 * 4u];
+            const float4 swg = *(const float4 *)&s_w[cur][g + 16u][ch4 * 4u];
+            const float4 swq = *(const float4 *)&s_w[cur][g + 24u][ch4 * 4u];
+            float4 sm0 = {0, 0, 0, 0}, sm8 = sm0, smg = sm0, smq = sm0;
+            if (UNPACK::HAS_MIN) {
+                sm0 = *(const float4 *)&s_m[cur][g][ch4 * 4u];
+                sm8 = *(const float4 *)&s_m[cur][g + 8u][ch4 * 4u];
+                smg = *(const float4 *)&s_m[cur][g + 16u][ch4 * 4u];
+                smq = *(const float4 *)&s_m[cur][g + 24u][ch4 * 4u];
+            }
+            #pragma unroll
+            for (uint32_t chi = 0; chi < 4u; chi++) {
+                const uint32_t ch = ch4 * 4u + chi;
+                const int32_t b = *(const int32_t *)(ybs + 4u + ch * 16u + tg * 4u);
+                if (UNPACK::HAS_MIN) {
+                    const float bs0 = yc0s ? (float)((const int16_t *)(yc0s + 4u + 256u))[ch] * d0 : 0.0f;
+                    const float bs1 = yc1s ? (float)((const int16_t *)(yc1s + 4u + 256u))[ch] * d1 : 0.0f;
+                    acc[0] -= f4_at(sm0, chi) * bs0;
+                    acc[1] -= f4_at(sm0, chi) * bs1;
+                    acc[2] -= f4_at(sm8, chi) * bs0;
+                    acc[3] -= f4_at(sm8, chi) * bs1;
+                    acc[4] -= f4_at(smg, chi) * bs0;
+                    acc[5] -= f4_at(smg, chi) * bs1;
+                    acc[6] -= f4_at(smq, chi) * bs0;
+                    acc[7] -= f4_at(smq, chi) * bs1;
+                }
+                uint32_t f[4];
+                ldmatrix_x4(f, &a_s[cur][lane][ch * 16u]);
+                int32_t dsum[4];
+                mma_s8_16x8x16(dsum, (const int32_t *)f, b);
+                acc[0] += (float)dsum[0] * f4_at(sw0, chi) * d0;
+                acc[1] += (float)dsum[1] * f4_at(sw0, chi) * d1;
+                acc[2] += (float)dsum[2] * f4_at(sw8, chi) * d0;
+                acc[3] += (float)dsum[3] * f4_at(sw8, chi) * d1;
+                mma_s8_16x8x16(dsum, (const int32_t *)(f + 2), b);
+                acc[4] += (float)dsum[0] * f4_at(swg, chi) * d0;
+                acc[5] += (float)dsum[1] * f4_at(swg, chi) * d1;
+                acc[6] += (float)dsum[2] * f4_at(swq, chi) * d0;
+                acc[7] += (float)dsum[3] * f4_at(swq, chi) * d1;
+            }
+        }
+        __syncthreads();
+    }
+#undef PULSAR_GEMM_STAGE
+
+    /* D fragment element -> (row, token): c0/c1 at rows g and g+8,
+     * repeated for the second 16-row tile */
+    #pragma unroll
+    for (uint32_t h = 0; h < 2u; h++) {
+        const uint32_t rg0 = r0 + 16u * h + g, rg8 = r0 + 16u * h + g + 8u;
+        if (t_c0 < n_tok) {
+            if (rg0 < out_dim) out[(uint64_t)t_c0 * out_dim + rg0] = acc[4u * h + 0u];
+            if (rg8 < out_dim) out[(uint64_t)t_c0 * out_dim + rg8] = acc[4u * h + 2u];
+        }
+        if (t_c1 < n_tok) {
+            if (rg0 < out_dim) out[(uint64_t)t_c1 * out_dim + rg0] = acc[4u * h + 1u];
+            if (rg8 < out_dim) out[(uint64_t)t_c1 * out_dim + rg8] = acc[4u * h + 3u];
+        }
+    }
+#endif
+}
+
 extern "C" int pulsar_matmul_kq(
         void *out_dev,
         const void *w_dev,
@@ -3603,6 +4036,65 @@ extern "C" int pulsar_matmul_kq(
     }
     const uint32_t in_blocks = in_dim / PULSAR_QK_K;
     dim3 block(32, 4, 1);
+    /* wide prefill batches on q4_K take the shared-memory GEMM: one
+     * weight read per 64 tokens instead of per 16. PULSAR_NO_GEMM=1
+     * falls back to the grouped path (uncached read: it is one launch). */
+    if (n_tok >= 32u &&
+        (quant == PULSAR_QUANT_Q4_K || quant == PULSAR_QUANT_Q6_K) &&
+        !getenv("PULSAR_NO_GEMM")) {
+        if (pulsar_device_cc_major() >= 8 && !getenv("PULSAR_NO_MMA")) {
+            dim3 mgrid((out_dim + 31u) / 32u, (n_tok + 63u) / 64u, 1);
+            if (quant == PULSAR_QUANT_Q4_K)
+                matmul_kq_gemm_mma_kernel<unpack_q4_K><<<mgrid, 256>>>(
+                        (float *)out_dev, (const char *)w_dev,
+                        (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes);
+            else
+                matmul_kq_gemm_mma_kernel<unpack_q6_K><<<mgrid, 256>>>(
+                        (float *)out_dev, (const char *)w_dev,
+                        (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes);
+            return cuda_ok(cudaGetLastError(), "matmul_kq_gemm_mma launch");
+        }
+        dim3 ggrid((out_dim + PULSAR_GEMM_BM - 1u) / PULSAR_GEMM_BM,
+                   (n_tok + PULSAR_GEMM_BN - 1u) / PULSAR_GEMM_BN, 1);
+        dim3 gblock(64, 4, 1);
+        if (quant == PULSAR_QUANT_Q4_K)
+            matmul_kq_gemm_q4K<<<ggrid, gblock>>>(
+                    (float *)out_dev, (const char *)w_dev,
+                    (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes);
+        else
+            matmul_kq_gemm_q6K<<<ggrid, gblock>>>(
+                    (float *)out_dev, (const char *)w_dev,
+                    (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes);
+        return cuda_ok(cudaGetLastError(), "matmul_kq_gemm launch");
+    }
+
+    /* Wide batches (prefill chunks) tile in groups of TT: each group
+     * reads the weights ONCE for its 16 tokens. Without this, anything
+     * past 16 fell through to the per-token kernel below, whose grid is
+     * (out_dim, n_tok) - i.e. one full weight pass PER TOKEN. That cliff
+     * is why the prefill chunk width was pinned at 16: widening it made
+     * prefill slower (4000 tok: 49s at width 16, 74s at width 128)
+     * instead of faster. Recursing per group keeps one code path.
+     * The group stays 16: TT=32 spills acc[] to local memory and
+     * measured 61.6s vs 45.2s. The kernel is LSU-bound on the q8
+     * activation loads (ncu: L1 94%, DRAM 28%), so a wider register
+     * tile buys nothing - getting past this needs the activations
+     * staged in shared memory, or tensor-core MMA. */
+    if (n_tok > 16u) {
+        const uint32_t in_blocks_g = in_dim / PULSAR_QK_K;
+        for (uint32_t base = 0; base < n_tok; base += 16u) {
+            const uint32_t cnt = n_tok - base < 16u ? n_tok - base : 16u;
+            if (!pulsar_matmul_kq(
+                    (float *)out_dev + (uint64_t)base * out_dim,
+                    w_dev,
+                    (const block_q8_K *)xq_dev + (uint64_t)base * in_blocks_g,
+                    in_dim, out_dim, cnt, row_bytes, quant)) {
+                return 0;
+            }
+        }
+        return 1;
+    }
+
     /* multi-token batches (MTP/DFlash verify, chunked prefill) tile
      * tokens over one weight read; q4_K/q6_K ride the warp-cooperative
      * dots for any 2..16 rows */
