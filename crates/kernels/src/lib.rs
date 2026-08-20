@@ -48,6 +48,11 @@ mod real {
         };
     }
 
+    /// OR into  to permit W4A4 at that call site (NVFP4 only).
+    /// The calibrated recipe applies fp4 activations to the FFN and the
+    /// full-attention projections, never to linear_attn/GDN, lm_head or
+    /// the MTP block.
+    pub const QUANT_A4_OK: u32 = 0x8000_0000;
     pub const QUANT_Q2_K: u32 = 0;
     pub const QUANT_IQ2_XXS: u32 = 1;
     pub const QUANT_Q4_K: u32 = 2;
@@ -89,9 +94,11 @@ mod real {
         fn pulsar_dspark_markov_argmax(logits: *const c_void, w2: *const c_void, state: *const c_void, vocab: u32, rank: u32, scratch: *mut c_void, out: *mut c_void) -> i32;
         fn pulsar_rms_norm(out: *mut c_void, x: *const c_void, w: *const c_void, n: u32, rows: u32, eps: f32) -> i32;
         fn pulsar_q8_0_matmul(out: *mut c_void, w: *const c_void, x: *const c_void, in_dim: u32, out_dim: u32, n_tok: u32) -> i32;
+        fn pulsar_preq_scratch_reserve(bytes: u64) -> i32;
         fn pulsar_q8_0_matmul_banked(out: *mut c_void, w: *const c_void, x: *const c_void, in_dim: u32, out_dim: u32, n_bank: u32, n_tok: u32) -> i32;
         fn pulsar_matmul_f32(out: *mut c_void, w: *const c_void, x: *const c_void, in_dim: u32, out_dim: u32, n_tok: u32) -> i32;
         fn pulsar_matmul_kq(out: *mut c_void, w: *const c_void, xq: *const c_void, in_dim: u32, out_dim: u32, n_tok: u32, row_bytes: u64, quant: u32) -> i32;
+        fn pulsar_bw_read(buf: *mut c_void, bytes: u64, sink: *mut c_void) -> i32;
         fn pulsar_idx_rope0(x: *mut c_void, n_tok: u32, n_head: u32, head_dim: u32, rot_dim: u32, pos0: u32, n_ctx_orig: u32, freq_base: f32, freq_scale: f32, ext_factor: f32, attn_factor: f32, beta_fast: f32, beta_slow: f32) -> i32;
         fn pulsar_idx_store_k(raw_k: *const c_void, w: *const c_void, b: *const c_void, cache: *mut c_void, pos0: u32, n_tok: u32, cache_cap: u32, head_dim: u32, rot_dim: u32, n_ctx_orig: u32, eps: f32, freq_base: f32, freq_scale: f32, ext_factor: f32, attn_factor: f32, beta_fast: f32, beta_slow: f32, fp8: u32) -> i32;
         fn pulsar_idx_score_one(scores: *mut c_void, q: *const c_void, weights: *const c_void, cache: *const c_void, n_rows: u32, n_head: u32, head_dim: u32, scale: f32, fp8: u32) -> i32;
@@ -106,6 +113,10 @@ mod real {
         fn pulsar_add(out: *mut c_void, a: *const c_void, b: *const c_void, n: u32) -> i32;
         fn pulsar_router_select(selected: *mut c_void, weights: *mut c_void, logits: *const c_void, bias: *const c_void, n_expert: u32, k_used: u32, weight_scale: f32, n_tok: u32, softmax_mode: u32, n_shexp: u32) -> i32;
         fn pulsar_quantize_q8_K(out: *mut c_void, x: *const c_void, in_dim: u32, n_rows: u32) -> i32;
+        fn pulsar_quantize_nvfp4(out: *mut c_void, x: *const c_void, in_dim: u32, n_rows: u32) -> i32;
+        fn pulsar_nvfp4_from_q8k(out: *mut c_void, xq: *const c_void, in_dim: u32, n_tok: u32) -> i32;
+        fn pulsar_matmul_nvfp4_a4(out: *mut c_void, w: *const c_void, xq: *const c_void, in_dim: u32, out_dim: u32, n_tok: u32, row_bytes: u64) -> i32;
+        fn pulsar_cc_major() -> i32;
         fn pulsar_moe_pair_swiglu(mid: *mut c_void, ptrs: *const c_void, weights: *const c_void, x: *const c_void, in_dim: u32, mid_dim: u32, n_used: u32, n_tok: u32, row_bytes: u64, quant: u32, act_op: u32) -> i32;
         fn pulsar_moe_down(out: *mut c_void, ptrs: *const c_void, mid: *const c_void, mid_dim: u32, out_dim: u32, n_used: u32, n_tok: u32, row_bytes: u64, quant: u32) -> i32;
         fn pulsar_moe_pair_swiglu_grouped(mid: *mut c_void, gptrs: *const c_void, starts: *const c_void, pairs: *const c_void, weights: *const c_void, xq: *const c_void, in_dim: u32, mid_dim: u32, n_used: u32, n_group: u32, row_bytes: u64, quant: u32, act_op: u32) -> i32;
@@ -156,6 +167,9 @@ mod real {
         fn pulsar_qwen35_gdn_batch(out: *mut c_void, state: *mut c_void, q: *const c_void, k: *const c_void, v: *const c_void, g: *const c_void, beta: *const c_void, h_v: u32, h_k: u32, dim: u32, n_tok: u32) -> i32;
         fn pulsar_qwen35_row_scale(x: *mut c_void, s: *const c_void, n_rows: u32, dim: u32) -> i32;
         fn pulsar_qwen35_draft_attn(out: *mut c_void, q: *const c_void, k: *const c_void, v: *const c_void, n_q: u32, n_kv: u32, n_head: u32, n_kv_head: u32, dim: u32, scale: f32) -> i32;
+        fn pulsar_qwen35_dflash2_conv(out: *mut c_void, h: *const c_void, delta: *const c_void, base: *const c_void, n_tok: u32, n_embd: u32, taps: u32, group: u32, side: u32) -> i32;
+        fn pulsar_qwen35_dflash2_topk_step(logits: *mut c_void, n_rows: u32, vocab: u32, it: u32, k: u32, ids: *mut c_void, vals: *mut c_void) -> i32;
+        fn pulsar_qwen35_dflash2_gather(out: *mut c_void, book: *const c_void, ids: *const c_void, n: u32, rank: u32) -> i32;
         fn pulsar_qwen35_rope_yarn(x: *mut c_void, n_tok: u32, n_head: u32, head_dim: u32, pos0: u32, freq_base: f32, freq_scale: f32, ext_factor: f32, attn_factor: f32, beta_fast: f32, beta_slow: f32, n_ctx_orig: u32) -> i32;
         fn pulsar_qwen35_split_qkv(q: *mut c_void, k: *mut c_void, v: *mut c_void, x: *const c_void, n_tok: u32, key_dim: u32, value_dim: u32) -> i32;
         fn pulsar_qwen35_ring_scatter(ring: *mut c_void, src: *const c_void, pos: u32, cap: u32, n_rows: u32, row_elems: u32, ring_stride: u32, ring_off: u32) -> i32;
@@ -351,7 +365,11 @@ mod real {
     /// the current device; returns 0.0 on any probe failure so a broken
     /// card ranks last instead of erroring placement.
     pub fn vram_bandwidth(dev: i32) -> f64 {
-        const MB64: usize = 64 << 20;
+        // 512MB, not 64MB: Ada/Blackwell L2 runs to 32MB, so a 64MB
+        // buffer is served largely from cache and every card reports the
+        // same ~390 GB/s regardless of its actual DRAM rate. Sized to
+        // dwarf any L2 on this generation.
+        const MB64: usize = 512 << 20;
         const D2D_KIND: i32 = 3;
         let cur = get_device();
         if set_device(dev).is_err() {
@@ -361,15 +379,16 @@ mod real {
         let mut b = std::ptr::null_mut();
         let mut best = 0f64;
         if unsafe { cudaMalloc(&mut a, MB64) } == 0 {
-            if unsafe { cudaMalloc(&mut b, MB64) } == 0 {
-                // one warmup, then best of 3 timed synchronous copies
-                unsafe { cudaMemcpy(b, a, MB64, D2D_KIND) };
+            if unsafe { cudaMalloc(&mut b, 16) } == 0 {
+                // one warmup, then best of 3 timed streaming reads
+                unsafe { pulsar_bw_read(a, MB64 as u64, b) };
+                unsafe { cudaDeviceSynchronize() };
                 for _ in 0..3 {
                     let t = std::time::Instant::now();
-                    if unsafe { cudaMemcpy(b, a, MB64, D2D_KIND) } == 0
+                    if unsafe { pulsar_bw_read(a, MB64 as u64, b) } != 0
                         && unsafe { cudaDeviceSynchronize() } == 0
                     {
-                        best = best.max(2.0 * MB64 as f64 / 1e9 / t.elapsed().as_secs_f64());
+                        best = best.max(MB64 as f64 / 1e9 / t.elapsed().as_secs_f64());
                     }
                 }
                 unsafe { cudaFree(b) };
@@ -441,6 +460,19 @@ mod real {
         Ok((free, total))
     }
 
+    /// Per-device free-VRAM budget for WEIGHT uploads (DeviceBuf::from_bytes
+    /// callers only). i64::MAX = untracked; 0 = pin everything new.
+    static WEIGHT_BUDGET: [std::sync::atomic::AtomicI64; 16] =
+        [const { std::sync::atomic::AtomicI64::new(i64::MAX) }; 16];
+
+    /// Cap weight VRAM on `dev` at `bytes` (engine passes free minus the
+    /// 3GiB state reserve for KV/activations/scratch/graph pools);
+    /// from_bytes
+    /// spends it and spills the overflow to pinned host RAM.
+    pub fn set_weight_vram_budget(dev: i32, bytes: i64) {
+        WEIGHT_BUDGET[dev as usize].store(bytes.clamp(0, i64::MAX), std::sync::atomic::Ordering::Relaxed);
+    }
+
     impl DeviceBuf {
         pub fn alloc(bytes: usize) -> Result<Self> {
             ensure_device();
@@ -460,16 +492,56 @@ mod real {
         /// (64-bit Linux) the pointer is valid on every device.
         pub fn alloc_pinned(bytes: usize) -> Result<Self> {
             ensure_device();
+            // PORTABLE matters on multi-GPU: without it the allocation is
+            // only registered in the context that made it, so another
+            // device copying out of the same host buffer is undefined.
+            // The TP staging buffer is allocated on card A and read by an
+            // H2D on card B, and the missing flag corrupted it
+            // deterministically - byte 0 survived while the middle of a
+            // 20KB transfer came back wrong, which is what made tensor
+            // parallel emit wrong tokens.
+            const PORTABLE: u32 = 1; // cudaHostAllocPortable
             const MAPPED: u32 = 2; // cudaHostAllocMapped
             let mut host = std::ptr::null_mut();
-            check_rt(unsafe { cudaHostAlloc(&mut host, bytes.max(1), MAPPED) }, "cudaHostAlloc")?;
+            check_rt(unsafe { cudaHostAlloc(&mut host, bytes.max(1), PORTABLE | MAPPED) }, "cudaHostAlloc")?;
             let mut dev = std::ptr::null_mut();
             check_rt(unsafe { cudaHostGetDevicePointer(&mut dev, host, 0) }, "cudaHostGetDevicePointer")?;
             Ok(DeviceBuf { ptr: dev, host, bytes, dev: -1 })
         }
 
         pub fn from_bytes(data: &[u8]) -> Result<Self> {
-            let mut b = Self::alloc(data.len())?;
+            // Weights only (every engine caller is a load-time weight).
+            // VRAM while the device's weight budget lasts, then mapped
+            // pinned host memory - zero-copy PCIe reads, the same path
+            // budgeted Mla/dsv4 attn weights already take every token.
+            // Activations and KV never come through here, so a full card
+            // degrades to host residency instead of a fatal cudaMalloc.
+            let dev = get_device();
+            use std::sync::atomic::Ordering;
+            let mut b = if WEIGHT_BUDGET[dev as usize].load(Ordering::Relaxed) >= data.len() as i64 {
+                match Self::alloc(data.len()) {
+                    Ok(b) => {
+                        WEIGHT_BUDGET[dev as usize].fetch_sub(data.len() as i64, Ordering::Relaxed);
+                        b
+                    }
+                    Err(_) => Self::weight_pinned(data)?,
+                }
+            } else {
+                Self::weight_pinned(data)?
+            };
+            b.write(0, data)?;
+            Ok(b)
+        }
+
+        fn weight_pinned(data: &[u8]) -> Result<Self> {
+            let dev = get_device();
+            use std::sync::atomic::Ordering;
+            if WEIGHT_BUDGET[dev as usize].swap(0, Ordering::Relaxed) != 0 {
+                eprintln!(
+                    "pulsar: weights exceed VRAM on device {dev} - overflow resident in pinned host RAM (zero-copy PCIe reads)"
+                );
+            }
+            let mut b = Self::alloc_pinned(data.len())?;
             b.write(0, data)?;
             Ok(b)
         }
@@ -885,6 +957,40 @@ mod real {
     /// Blocking cudaMemcpy: legacy-stream ordered on the current device,
     /// so issue it with the producer's device current and the consumer
     /// device's later launches see the data.
+    /// An event for ordering work across cards. Recordable only on the
+    /// device that was current when it was created; waiting on it from
+    /// another device's stream is legal (and is the whole point).
+    pub struct XEvent(*mut c_void);
+    unsafe impl Send for XEvent {}
+    impl XEvent {
+        pub fn new() -> Result<XEvent> {
+            const DISABLE_TIMING: u32 = 2;
+            let mut e: *mut c_void = std::ptr::null_mut();
+            check_rt(unsafe { cudaEventCreateWithFlags(&mut e, DISABLE_TIMING) }, "xevent create")?;
+            Ok(XEvent(e))
+        }
+        pub fn record(&self) -> Result {
+            check_rt(unsafe { cudaEventRecord(self.0, STREAM_PER_THREAD) }, "xevent record")
+        }
+        pub fn wait(&self) -> Result {
+            check_rt(unsafe { cudaStreamWaitEvent(STREAM_PER_THREAD, self.0, 0) }, "xevent wait")
+        }
+    }
+
+    /// Async cross-device copy on the CURRENT device's stream. Issue it on
+    /// the CONSUMER's stream after waiting on the producer's event: that
+    /// orders the consumer's own prior reads of dst before the overwrite,
+    /// which a copy issued on the producer's stream would race. The point
+    /// of async here is that the host stops blocking at every bank
+    /// boundary, which is what serialized the three cards.
+    pub fn copy_across_async(dst: &mut DeviceBuf, src: &DeviceBuf, bytes: usize) -> Result {
+        assert!(bytes <= dst.bytes() && bytes <= src.bytes());
+        check_rt(
+            unsafe { cudaMemcpyAsync(dst.ptr_mut(), src.ptr(), bytes, MEMCPY_DEFAULT, STREAM_PER_THREAD) },
+            "copy across async",
+        )
+    }
+
     pub fn copy_across(dst: &mut DeviceBuf, src: &DeviceBuf, bytes: usize) -> Result {
         assert!(bytes <= dst.bytes() && bytes <= src.bytes());
         check_rt(
@@ -911,6 +1017,16 @@ mod real {
 
     pub fn embed_q8_0(out: &mut DeviceBuf, w: &DeviceBuf, tokens: &DeviceBuf, n_embd: u32, n_vocab: u32, n_tok: u32) -> Result {
         check(unsafe { pulsar_embed_q8_0(out.ptr_mut(), w.ptr(), tokens.ptr(), n_embd, n_vocab, n_tok) }, "embed_q8_0")
+    }
+
+    /// embed_q8_0 starting at token index `tok_off` of `tokens`. Lets a
+    /// prefill upload the whole prompt's ids ONCE and walk it per chunk:
+    /// the per-chunk 512B `write` was a synchronous cudaMemcpy, and each
+    /// one drained the device - 11.4s of a 12s 7k-token prefill.
+    pub fn embed_q8_0_at(out: &mut DeviceBuf, w: &DeviceBuf, tokens: &DeviceBuf, tok_off: u32, n_embd: u32, n_vocab: u32, n_tok: u32) -> Result {
+        assert!(((tok_off + n_tok) as usize) * 4 <= tokens.bytes());
+        let p = unsafe { (tokens.ptr() as *const u8).add(tok_off as usize * 4) as *const c_void };
+        check(unsafe { pulsar_embed_q8_0(out.ptr_mut(), w.ptr(), p, n_embd, n_vocab, n_tok) }, "embed_q8_0_at")
     }
 
     /// DSpark fused markov argmax over one logits row: returns
@@ -957,6 +1073,13 @@ mod real {
 
     pub fn matmul_q8_0(out: &mut DeviceBuf, w: &DeviceBuf, x: &DeviceBuf, in_dim: u32, out_dim: u32, n_tok: u32) -> Result {
         check(unsafe { pulsar_q8_0_matmul(out.ptr_mut(), w.ptr(), x.ptr(), in_dim, out_dim, n_tok) }, "matmul_q8_0")
+    }
+
+    /// Pre-allocate the q8_0 prequant scratch on the CURRENT device so a
+    /// later matmul_q8_0 inside a CUDA-graph capture hits the cached
+    /// pointer: cudaMalloc is illegal mid-capture.
+    pub fn preq_scratch_reserve(bytes: u64) -> Result {
+        check(unsafe { pulsar_preq_scratch_reserve(bytes) }, "preq_scratch_reserve")
     }
 
     /// Banked matmul: x is n_tok*n_bank contiguous pseudo-rows of in_dim,
@@ -1116,6 +1239,43 @@ mod real {
         check(unsafe { pulsar_quantize_q8_K(out.ptr_mut(), x.ptr(), in_dim, n_rows) }, "quantize_q8_k")
     }
 
+    /// Bytes per 256 values of NVFP4: 4 blocks of (4 ue4m3 scales + 32
+    /// nibble bytes). One block is exactly one m16n8k64 mma.
+    pub const NVFP4_SB_BYTES: usize = 144;
+
+    /// Compute-capability major of the current device. 12 is Blackwell,
+    /// the only tier carrying the FP4 tensor ops.
+    pub fn cc_major() -> i32 {
+        unsafe { pulsar_cc_major() }
+    }
+
+    /// Bytes an NVFP4 activation buffer needs. Rows round up to a whole
+    /// octet: the GEMM reads 8 tokens per tile, and the quantizer fills
+    /// the padding by repeating the last real token.
+    pub fn nvfp4_act_bytes(in_dim: u32, n_tok: u32) -> usize {
+        (((n_tok + 7) & !7) as usize) * (in_dim as usize / 256) * NVFP4_SB_BYTES
+    }
+
+    /// f32 -> NVFP4. Same 4-bit encoding as the weights but an
+    /// octet-major tile, so a warp's B fragment is one contiguous
+    /// region; see PULSAR_NVFP4_ACT_TILE in the kernels.
+    pub fn quantize_nvfp4(out: &mut DeviceBuf, x: &DeviceBuf, in_dim: u32, n_rows: u32) -> Result {
+        check(unsafe { pulsar_quantize_nvfp4(out.ptr_mut(), x.ptr(), in_dim, n_rows) }, "quantize_nvfp4")
+    }
+
+    /// q8_K activations -> NVFP4, the route matmul_kq takes when
+    /// PULSAR_FP4 is set. Quantizes twice by construction.
+    pub fn nvfp4_from_q8k(out: &mut DeviceBuf, xq: &DeviceBuf, in_dim: u32, n_tok: u32) -> Result {
+        check(unsafe { pulsar_nvfp4_from_q8k(out.ptr_mut(), xq.ptr(), in_dim, n_tok) }, "nvfp4_from_q8k")
+    }
+
+    /// W4A4 prefill GEMM on Blackwell tensor cores: NVFP4 on both sides
+    /// with hardware per-16 block scaling and no dequantization at all.
+    /// Requires sm_120a; see docs/blackwell-fp4-mma.md.
+    pub fn matmul_nvfp4_a4(out: &mut DeviceBuf, w: &DeviceBuf, xq: &DeviceBuf, in_dim: u32, out_dim: u32, n_tok: u32, row_bytes: u64) -> Result {
+        check(unsafe { pulsar_matmul_nvfp4_a4(out.ptr_mut(), w.ptr(), xq.ptr(), in_dim, out_dim, n_tok, row_bytes) }, "matmul_nvfp4_a4")
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn moe_pair_swiglu(mid: &mut DeviceBuf, ptrs: &DeviceBuf, weights: &DeviceBuf, x: &DeviceBuf, in_dim: u32, mid_dim: u32, n_used: u32, n_tok: u32, row_bytes: u64, quant: u32, act_op: u32) -> Result {
         check(
@@ -1196,7 +1356,8 @@ mod real {
 
     /// KV cache storage format (kvq). 0 = f32 (exact), 1 = fp8 e4m3 +
     /// per-row scale, 2 = fp16, 3 = int8 + per-row scale, 4 = q8_0,
-    /// 5 = q4_0. Opt-in via PULSAR_KV=<fmt>; row stride per format.
+    /// 5 = q4_0, 6-10 = dsv4-only turbo3/2 + tcq. Opt-in via
+    /// PULSAR_KV=<fmt>; row stride per format.
     #[allow(clippy::too_many_arguments)]
     pub fn gqa_kv_append(cache: &mut DeviceBuf, kv: &DeviceBuf, n_tok: u32, n_kv_head: u32, head_dim: u32, cap: u32, pos0: u32, kvq: u32) -> Result {
         check(unsafe { pulsar_gqa_kv_append(cache.ptr_mut(), kv.ptr(), n_tok, n_kv_head, head_dim, cap, pos0, kvq) }, "gqa_kv_append")
@@ -1431,6 +1592,23 @@ mod real {
 
     /// Non-causal GQA attention over contiguous K/V rows (DFlash draft).
     #[allow(clippy::too_many_arguments)]
+    /// DFlash2 grouped block-conv (side 0 = prepare, 1 = finish). `delta`
+    /// is the kernel-projection output [n_tok][2][taps][n_embd/group].
+    pub fn qwen35_dflash2_conv(out: &mut DeviceBuf, h: &DeviceBuf, delta: &DeviceBuf, base: &DeviceBuf, n_tok: u32, n_embd: u32, taps: u32, group: u32, side: u32) -> Result {
+        check(unsafe { pulsar_qwen35_dflash2_conv(out.ptr_mut(), h.ptr(), delta.ptr(), base.ptr(), n_tok, n_embd, taps, group, side) }, "qwen35_dflash2_conv")
+    }
+
+    /// One row-wise top-k extraction step: record slot `it` and mask it.
+    /// Destructive on `logits`. k calls give each row's top-k ids/values.
+    pub fn qwen35_dflash2_topk_step(logits: &mut DeviceBuf, n_rows: u32, vocab: u32, it: u32, k: u32, ids: &mut DeviceBuf, vals: &mut DeviceBuf) -> Result {
+        check(unsafe { pulsar_qwen35_dflash2_topk_step(logits.ptr_mut(), n_rows, vocab, it, k, ids.ptr_mut(), vals.ptr_mut()) }, "qwen35_dflash2_topk_step")
+    }
+
+    /// Gather f16 codebook rows by token id into f32: out[i] = book[ids[i]].
+    pub fn qwen35_dflash2_gather(out: &mut DeviceBuf, book: &DeviceBuf, ids: &DeviceBuf, n: u32, rank: u32) -> Result {
+        check(unsafe { pulsar_qwen35_dflash2_gather(out.ptr_mut(), book.ptr(), ids.ptr(), n, rank) }, "qwen35_dflash2_gather")
+    }
+
     pub fn qwen35_draft_attn(out: &mut DeviceBuf, q: &DeviceBuf, k: &DeviceBuf, v: &DeviceBuf, n_q: u32, n_kv: u32, n_head: u32, n_kv_head: u32, dim: u32, scale: f32) -> Result {
         check(unsafe { pulsar_qwen35_draft_attn(out.ptr_mut(), q.ptr(), k.ptr(), v.ptr(), n_q, n_kv, n_head, n_kv_head, dim, scale) }, "qwen35_draft_attn")
     }
@@ -1624,6 +1802,49 @@ mod tests {
     /// Effective bandwidth of matmul_kq per quant on a dense-27B FFN
     /// shape - a probe, not a correctness test (weights are pseudorandom
     /// bytes; every wdot path is branchless so timing is data-blind).
+    /// TpLink moves a whole buffer between two devices, not just its head.
+    /// A partial transfer here is what made tensor parallel emit wrong
+    /// tokens: byte 0 arrived, the middle did not.
+    #[test]
+    fn tplink_transfers_whole_buffer() {
+        use super::*;
+        if device_count() < 2 {
+            eprintln!("tplink test: needs 2 devices, skipping");
+            return;
+        }
+        let n = 5120usize; // one qwen35 row
+        let src_host: Vec<f32> = (0..n).map(|i| (i as f32) * 0.001 - 2.0).collect();
+        let primary = get_device();
+        let other = (0..device_count()).find(|&d| d != primary).unwrap();
+
+        set_device(primary).unwrap();
+        let mut a = DeviceBuf::alloc(n * 4).unwrap();
+        a.write(0, as_bytes(&src_host)).unwrap();
+        let link = TpLink::new(n * 4).unwrap();
+
+        set_device(other).unwrap();
+        let mut b = DeviceBuf::alloc(n * 4).unwrap();
+        let zero = vec![0u8; n * 4];
+        b.write(0, &zero).unwrap();
+
+        set_device(primary).unwrap();
+        link.send(&a, n * 4).unwrap();
+        set_device(other).unwrap();
+        link.recv(&mut b, n * 4).unwrap();
+        sync().unwrap();
+        let got = b.read_f32(n).unwrap();
+        set_device(primary).unwrap();
+
+        let bad: Vec<usize> = (0..n).filter(|&i| got[i] != src_host[i]).collect();
+        if !bad.is_empty() {
+            eprintln!(
+                "tplink: {} of {n} elements wrong; first {:?}, at {} got {} want {}",
+                bad.len(), &bad[..bad.len().min(8)], bad[0], got[bad[0]], src_host[bad[0]]
+            );
+        }
+        assert!(bad.is_empty(), "TpLink delivered a partial buffer");
+    }
+
     #[test]
     fn kq_gemm_matches_reference() {
         use super::*;
@@ -1632,16 +1853,28 @@ mod tests {
         let n_tok = 70u32; // >= 32 takes the gemm; 70 exercises the token tail
         let blocks = (in_dim / 256) as usize;
         for &(quant, bpb, d_off, name) in
-            &[(QUANT_Q4_K, 144usize, 0usize, "q4_K"), (QUANT_Q6_K, 210, 208, "q6_K")]
+            &[(QUANT_Q4_K, 144usize, 0usize, "q4_K"), (QUANT_Q6_K, 210, 208, "q6_K"),
+              (QUANT_NVFP4, 144, 0, "nvfp4")]
         {
         let rb = blocks * bpb;
         let wbytes = out_dim as usize * rb;
         let mut host: Vec<u8> = (0..wbytes).map(|i| (i.wrapping_mul(2654435761) >> 7) as u8).collect();
         // pin every block's f16 scale fields to finite values
         for b in 0..out_dim as usize * blocks {
-            host[b * bpb + d_off..b * bpb + d_off + 2].copy_from_slice(&0x3400u16.to_le_bytes()); // d = 0.25
-            if quant == QUANT_Q4_K {
-                host[b * bpb + 2..b * bpb + 4].copy_from_slice(&0x3000u16.to_le_bytes()); // dmin = 0.125
+            if quant == QUANT_NVFP4 {
+                // 4 sub-blocks of 36B; bytes 0..4 of each are UE4M3
+                // scales, and 0 / 0x7F both mean "zero block" - pin a
+                // finite one or the test compares zeros to zeros.
+                for sb in 0..4 {
+                    for k in 0..4 {
+                        host[b * bpb + sb * 36 + k] = 0x40;
+                    }
+                }
+            } else {
+                host[b * bpb + d_off..b * bpb + d_off + 2].copy_from_slice(&0x3400u16.to_le_bytes()); // d = 0.25
+                if quant == QUANT_Q4_K {
+                    host[b * bpb + 2..b * bpb + 4].copy_from_slice(&0x3000u16.to_le_bytes()); // dmin = 0.125
+                }
             }
         }
         let mut w = DeviceBuf::alloc(wbytes).unwrap();
@@ -1679,6 +1912,480 @@ mod tests {
         // greedy-ids equality at the engine level is the hard gate.
         assert!(worst < 2e-3, "{name} gemm diverges from the grouped path: {worst}");
         }
+    }
+
+    /// The FP4 GEMM is checked against a CPU decode of the very same
+    /// bytes the hardware reads, so a wrong fragment layout or a
+    /// misrouted scale lane shows up as a gross mismatch rather than
+    /// hiding under a tolerance. Skips on non-Blackwell devices.
+    #[test]
+    fn nvfp4_a4_gemm_matches_reference() {
+        use super::*;
+        if cc_major() < 12 {
+            eprintln!("nvfp4 a4: needs sm_120a, device is cc {}", cc_major());
+            return;
+        }
+        fn e2m1(c: u8) -> f32 {
+            const M: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+            let v = M[(c & 7) as usize];
+            if c & 8 != 0 { -v } else { v }
+        }
+        fn ue4m3(x: u8) -> f32 {
+            if x == 0 || x == 0x7F { return 0.0; }
+            let e = ((x >> 3) & 0xF) as i32;
+            let m = (x & 7) as f32;
+            if e == 0 { m * 2f32.powi(-9) } else { (1.0 + m / 8.0) * 2f32.powi(e - 7) }
+        }
+        // 36B block: 4 scale bytes then 32 nibble bytes, low nibbles
+        // values 0..7 of a 16-value sub-block and high nibbles 8..15
+        fn decode(bytes: &[u8], n: usize) -> Vec<f32> {
+            let mut out = vec![0f32; n];
+            for sb in 0..n / 256 {
+                for b in 0..4 {
+                    let base = sb * 144 + b * 36;
+                    for s in 0..4 {
+                        let sc = ue4m3(bytes[base + s]);
+                        for i in 0..8 {
+                            let by = bytes[base + 4 + s * 8 + i];
+                            out[sb * 256 + b * 64 + s * 16 + i] = e2m1(by & 0xF) * sc;
+                            out[sb * 256 + b * 64 + s * 16 + i + 8] = e2m1(by >> 4) * sc;
+                        }
+                    }
+                }
+            }
+            out
+        }
+
+        let in_dim = 512u32;
+        let out_dim = 96u32;
+        let n_tok = 70u32; // deliberately not a multiple of 64: tail path
+        let blocks = (in_dim / 256) as usize;
+        let rb = blocks * NVFP4_SB_BYTES;
+
+        let mut host: Vec<u8> = (0..out_dim as usize * rb)
+            .map(|i| (i.wrapping_mul(2654435761) >> 7) as u8)
+            .collect();
+        // pin every scale byte finite and nonzero: 0 is a zero block and
+        // 0x7F is NaN in hardware even though ggml reads it as zero
+        for b in 0..out_dim as usize * blocks * 4 {
+            for s in 0..4 {
+                host[b * 36 + s] = 0x30 + ((b + s) % 12) as u8;
+            }
+        }
+        let mut w = DeviceBuf::alloc(host.len()).unwrap();
+        w.write(0, &host).unwrap();
+
+        let x: Vec<f32> = (0..(in_dim * n_tok) as usize)
+            .map(|i| ((i * 37) % 97) as f32 * 0.01 - 0.5)
+            .collect();
+        let mut xf = DeviceBuf::alloc(x.len() * 4).unwrap();
+        xf.write(0, as_bytes(&x)).unwrap();
+        let abytes = nvfp4_act_bytes(in_dim, n_tok);
+        let mut xq = DeviceBuf::alloc(abytes).unwrap();
+        quantize_nvfp4(&mut xq, &xf, in_dim, n_tok).unwrap();
+        sync().unwrap();
+        let mut aq = vec![0u8; abytes];
+        xq.read(0, &mut aq).unwrap();
+        // activations land octet-major; rebuild the plain per-token
+        // layout so one decoder serves both operands
+        let mut aplain = vec![0u8; n_tok as usize * rb];
+        for t in 0..n_tok as usize {
+            let (o, r) = (t / 8, t % 8);
+            for sb in 0..blocks {
+                for kb in 0..4 {
+                    let src = (o * blocks + sb) * 1152 + kb * 288;
+                    let dst = t * rb + sb * 144 + kb * 36;
+                    aplain[dst..dst + 4]
+                        .copy_from_slice(&aq[src + 256 + r * 4..src + 260 + r * 4]);
+                    aplain[dst + 4..dst + 36]
+                        .copy_from_slice(&aq[src + r * 32..src + r * 32 + 32]);
+                }
+            }
+        }
+        let aq = aplain;
+
+        // the quantizer stands on its own: e2m1 with a scale of absmax/6
+        // cannot err by more than about absmax/6 anywhere
+        let adec = decode(&aq, (in_dim * n_tok) as usize);
+        for t in 0..n_tok as usize {
+            for sub in 0..(in_dim / 16) as usize {
+                let o = t * in_dim as usize + sub * 16;
+                let amax = (0..16).fold(0f32, |m, i| m.max(x[o + i].abs()));
+                for i in 0..16 {
+                    let e = (adec[o + i] - x[o + i]).abs();
+                    assert!(e <= 0.25 * amax + 1e-6,
+                        "nvfp4 quantize err {e} at t{t} sub{sub} i{i} (amax {amax})");
+                }
+            }
+        }
+
+        let wdec = decode(&host, out_dim as usize * in_dim as usize);
+        let mut want = vec![0f32; (n_tok * out_dim) as usize];
+        for t in 0..n_tok as usize {
+            for r in 0..out_dim as usize {
+                let mut acc = 0f64;
+                for k in 0..in_dim as usize {
+                    acc += (wdec[r * in_dim as usize + k] * adec[t * in_dim as usize + k]) as f64;
+                }
+                want[t * out_dim as usize + r] = acc as f32;
+            }
+        }
+
+        let mut out = DeviceBuf::alloc((n_tok * out_dim) as usize * 4).unwrap();
+        matmul_nvfp4_a4(&mut out, &w, &xq, in_dim, out_dim, n_tok, rb as u64).unwrap();
+        sync().unwrap();
+        let got = out.read_f32((n_tok * out_dim) as usize).unwrap();
+
+        let mut worst = 0f32;
+        for i in 0..got.len() {
+            let d = (got[i] - want[i]).abs() / want[i].abs().max(1.0);
+            if d > worst { worst = d; }
+        }
+        eprintln!("nvfp4 a4 gemm vs cpu decode: worst rel diff {worst:.2e}");
+        // both sides sum the identical decoded values, so only f32
+        // accumulation order differs; a layout bug measures in percent
+        assert!(worst < 1e-4, "nvfp4 a4 gemm diverges from the decode: {worst}");
+    }
+
+    /// Where does the W4A4 error actually come from? Compares three
+    /// activation routes against an f32 reference over identical NVFP4
+    /// weights, so the fp4-activation cost is separated from the
+    /// double-quantization cost of going through q8_K.
+    ///
+    /// cargo test --release -p kernels nvfp4_activation_error -- --ignored --nocapture
+    #[test]
+    #[ignore = "diagnostic, requires a Blackwell CUDA device"]
+    fn nvfp4_activation_error() {
+        use super::*;
+        if cc_major() < 12 {
+            eprintln!("needs sm_120a, device is cc {}", cc_major());
+            return;
+        }
+        fn e2m1(c: u8) -> f32 {
+            const M: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+            let v = M[(c & 7) as usize];
+            if c & 8 != 0 { -v } else { v }
+        }
+        fn ue4m3(x: u8) -> f32 {
+            if x == 0 || x == 0x7F { return 0.0; }
+            let e = ((x >> 3) & 0xF) as i32;
+            let m = (x & 7) as f32;
+            if e == 0 { m * 2f32.powi(-9) } else { (1.0 + m / 8.0) * 2f32.powi(e - 7) }
+        }
+        fn decode(bytes: &[u8], n: usize) -> Vec<f32> {
+            let mut out = vec![0f32; n];
+            for sb in 0..n / 256 {
+                for b in 0..4 {
+                    let base = sb * 144 + b * 36;
+                    for sq in 0..4 {
+                        let sc = ue4m3(bytes[base + sq]);
+                        for i in 0..8 {
+                            let by = bytes[base + 4 + sq * 8 + i];
+                            out[sb * 256 + b * 64 + sq * 16 + i] = e2m1(by & 0xF) * sc;
+                            out[sb * 256 + b * 64 + sq * 16 + i + 8] = e2m1(by >> 4) * sc;
+                        }
+                    }
+                }
+            }
+            out
+        }
+
+        let in_dim = 2048u32;
+        let out_dim = 256u32;
+        let n_tok = 64u32;
+        let blocks = (in_dim / 256) as usize;
+        let rb = blocks * NVFP4_SB_BYTES;
+
+        let mut host: Vec<u8> = (0..out_dim as usize * rb)
+            .map(|i| (i.wrapping_mul(2654435761) >> 7) as u8)
+            .collect();
+        for b in 0..out_dim as usize * blocks * 4 {
+            for sq in 0..4 { host[b * 36 + sq] = 0x30 + ((b + sq) % 12) as u8; }
+        }
+        let mut w = DeviceBuf::alloc(host.len()).unwrap();
+        w.write(0, &host).unwrap();
+        let wdec = decode(&host, out_dim as usize * in_dim as usize);
+
+        // gaussian-ish activations: a flat ramp hides how badly fp4 handles
+        // the heavy tail that real hidden states have
+        let x: Vec<f32> = (0..(in_dim * n_tok) as usize)
+            .map(|i| {
+                let a = ((i * 2654435761usize) % 10007) as f32 / 10007.0 - 0.5;
+                let b = ((i * 40503usize) % 9973) as f32 / 9973.0 - 0.5;
+                (a + b) * 2.0
+            })
+            .collect();
+        let mut xf = DeviceBuf::alloc(x.len() * 4).unwrap();
+        xf.write(0, as_bytes(&x)).unwrap();
+
+        let mut want = vec![0f32; (n_tok * out_dim) as usize];
+        for t in 0..n_tok as usize {
+            for r in 0..out_dim as usize {
+                let mut acc = 0f64;
+                for k in 0..in_dim as usize {
+                    acc += (wdec[r * in_dim as usize + k] * x[t * in_dim as usize + k]) as f64;
+                }
+                want[t * out_dim as usize + r] = acc as f32;
+            }
+        }
+        let rms_ref = (want.iter().map(|v| (v * v) as f64).sum::<f64>() / want.len() as f64).sqrt();
+
+        let rel = |got: &[f32]| -> f64 {
+            let e = got.iter().zip(&want).map(|(g, w)| ((g - w) as f64).powi(2)).sum::<f64>();
+            (e / got.len() as f64).sqrt() / rms_ref
+        };
+
+        let mut out = DeviceBuf::alloc((n_tok * out_dim) as usize * 4).unwrap();
+        let abytes = nvfp4_act_bytes(in_dim, n_tok);
+
+        // A: f32 -> NVFP4 directly
+        let mut a4 = DeviceBuf::alloc(abytes).unwrap();
+        quantize_nvfp4(&mut a4, &xf, in_dim, n_tok).unwrap();
+        matmul_nvfp4_a4(&mut out, &w, &a4, in_dim, out_dim, n_tok, rb as u64).unwrap();
+        sync().unwrap();
+        let ea = rel(&out.read_f32((n_tok * out_dim) as usize).unwrap());
+
+        // B: f32 -> q8_K -> NVFP4, what matmul_kq does under PULSAR_FP4
+        let mut x8 = DeviceBuf::alloc(n_tok as usize * blocks * Q8_K_BLOCK_BYTES).unwrap();
+        quantize_q8_k(&mut x8, &xf, in_dim, n_tok).unwrap();
+        let mut b4 = DeviceBuf::alloc(abytes).unwrap();
+        nvfp4_from_q8k(&mut b4, &x8, in_dim, n_tok).unwrap();
+        matmul_nvfp4_a4(&mut out, &w, &b4, in_dim, out_dim, n_tok, rb as u64).unwrap();
+        sync().unwrap();
+        let eb = rel(&out.read_f32((n_tok * out_dim) as usize).unwrap());
+
+        // C: q8_K activations through the int8 mma, the shipping path
+        matmul_kq(&mut out, &w, &x8, in_dim, out_dim, n_tok, rb as u64, QUANT_NVFP4).unwrap();
+        sync().unwrap();
+        let ec = rel(&out.read_f32((n_tok * out_dim) as usize).unwrap());
+
+        eprintln!("activation error vs f32 reference (relative RMS):");
+        eprintln!("  A  f32 -> nvfp4        {ea:.4}");
+        eprintln!("  B  f32 -> q8_K -> nvfp4 {eb:.4}");
+        eprintln!("  C  q8_K, int8 mma      {ec:.4}   <- shipping path");
+        eprintln!("  fp4 activation cost over int8: {:.1}x", ea / ec);
+        eprintln!("  double-quantization cost:      {:.2}x", eb / ea);
+    }
+
+    /// TP shard contract: matmul_kq over a matw_col_half-style shard
+    /// (first half of every row's bytes, row_bytes halved, in_dim halved)
+    /// must equal matmul_kq over the full row with the upper half of the
+    /// activations zeroed. n_tok 1 / 8 / 64 cover the dot, token-tile
+    /// and GEMM dispatch paths. If this fails, the sliced-row_bytes
+    /// kernel path is the TP bug; if it passes, the fault is in how the
+    /// engine builds the shard at load.
+    ///
+    /// cargo test --release -p kernels nvfp4_col_shard -- --ignored --nocapture
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn nvfp4_col_shard_matches_full() {
+        use super::*;
+        let in_dim = 6144u32; // ssm_out's real value_dim
+        let half = in_dim / 2;
+        let out_dim = 64u32;
+        let blocks = (in_dim / 256) as usize; // 24 superblocks per row
+        let rb = blocks * NVFP4_SB_BYTES; // 3456
+        let hb = rb / 2; // 1728, superblock-aligned
+
+        let mut host: Vec<u8> = (0..out_dim as usize * rb)
+            .map(|i| (i.wrapping_mul(2654435761) >> 7) as u8)
+            .collect();
+        for b in 0..out_dim as usize * blocks * 4 {
+            for sq in 0..4 {
+                host[b * 36 + sq] = 0x30 + ((b + sq) % 12) as u8;
+            }
+        }
+        let mut w_full = DeviceBuf::alloc(host.len()).unwrap();
+        w_full.write(0, &host).unwrap();
+        // matw_col_half, verbatim: first hb bytes of every row, contiguous
+        let mut sl = Vec::with_capacity(out_dim as usize * hb);
+        for r in 0..out_dim as usize {
+            sl.extend_from_slice(&host[r * rb..r * rb + hb]);
+        }
+        let mut w_half = DeviceBuf::alloc(sl.len()).unwrap();
+        w_half.write(0, &sl).unwrap();
+
+        for &n_tok in &[1u32, 8, 64] {
+            let x: Vec<f32> = (0..(in_dim * n_tok) as usize)
+                .map(|i| {
+                    if (i as u32 % in_dim) >= half {
+                        0.0
+                    } else {
+                        ((i * 2654435761usize) % 10007) as f32 / 10007.0 - 0.5
+                    }
+                })
+                .collect();
+            let xh: Vec<f32> = (0..n_tok as usize)
+                .flat_map(|t| {
+                    let b = t * in_dim as usize;
+                    x[b..b + half as usize].to_vec()
+                })
+                .collect();
+
+            let mut xf = DeviceBuf::alloc(x.len() * 4).unwrap();
+            xf.write(0, as_bytes(&x)).unwrap();
+            let mut xq = DeviceBuf::alloc(n_tok as usize * blocks * Q8_K_BLOCK_BYTES).unwrap();
+            quantize_q8_k(&mut xq, &xf, in_dim, n_tok).unwrap();
+
+            let mut xfh = DeviceBuf::alloc(xh.len() * 4).unwrap();
+            xfh.write(0, as_bytes(&xh)).unwrap();
+            let mut xqh = DeviceBuf::alloc(n_tok as usize * (blocks / 2) * Q8_K_BLOCK_BYTES).unwrap();
+            quantize_q8_k(&mut xqh, &xfh, half, n_tok).unwrap();
+
+            let n_out = (n_tok * out_dim) as usize;
+            let mut out_f = DeviceBuf::alloc(n_out * 4).unwrap();
+            matmul_kq(&mut out_f, &w_full, &xq, in_dim, out_dim, n_tok, rb as u64, QUANT_NVFP4).unwrap();
+            let mut out_h = DeviceBuf::alloc(n_out * 4).unwrap();
+            matmul_kq(&mut out_h, &w_half, &xqh, half, out_dim, n_tok, hb as u64, QUANT_NVFP4).unwrap();
+            sync().unwrap();
+
+            let a = out_f.read_f32(n_out).unwrap();
+            let b = out_h.read_f32(n_out).unwrap();
+            let mut worst = 0f32;
+            let mut wi = 0usize;
+            for i in 0..n_out {
+                let d = (a[i] - b[i]).abs();
+                if d > worst {
+                    worst = d;
+                    wi = i;
+                }
+            }
+            eprintln!(
+                "n_tok {n_tok:>2}: max |full - shard| = {worst:.3e} at [{wi}] (full {} shard {})",
+                a[wi], b[wi]
+            );
+            assert!(worst < 1e-4, "n_tok {n_tok}: shard diverges from full at [{wi}]");
+        }
+    }
+
+    /// cargo test --release -p kernels nvfp4_a4_bench -- --ignored --nocapture
+    ///
+    /// The int8 mma path and the FP4 path over the IDENTICAL weight
+    /// bytes, so the only difference measured is how they are consumed.
+    #[test]
+    #[ignore = "perf probe, requires a Blackwell CUDA device"]
+    fn nvfp4_a4_bench() {
+        use super::*;
+        use std::time::Instant;
+        if cc_major() < 12 {
+            eprintln!("nvfp4 a4 bench: needs sm_120a, device is cc {}", cc_major());
+            return;
+        }
+        let out_dim = 16384u32;
+        let in_dim = 4096u32;
+        let blocks = (in_dim / 256) as usize;
+        let rb = blocks * NVFP4_SB_BYTES;
+        for n_tok in [128u32, 512, 2048] {
+        eprintln!(" n_tok {n_tok}:");
+
+        let mut host: Vec<u8> = (0..out_dim as usize * rb)
+            .map(|i| (i.wrapping_mul(2654435761) >> 7) as u8)
+            .collect();
+        for b in 0..out_dim as usize * blocks * 4 {
+            for sc in 0..4 {
+                host[b * 36 + sc] = 0x30 + ((b + sc) % 12) as u8;
+            }
+        }
+        let mut w = DeviceBuf::alloc(host.len()).unwrap();
+        w.write(0, &host).unwrap();
+
+        let x: Vec<f32> = (0..(in_dim * n_tok) as usize)
+            .map(|i| ((i * 37) % 97) as f32 * 0.01 - 0.5)
+            .collect();
+        let mut xf = DeviceBuf::alloc(x.len() * 4).unwrap();
+        xf.write(0, as_bytes(&x)).unwrap();
+
+        let mut x8 = DeviceBuf::alloc(n_tok as usize * blocks * Q8_K_BLOCK_BYTES).unwrap();
+        let mut x4 = DeviceBuf::alloc(nvfp4_act_bytes(in_dim, n_tok)).unwrap();
+        let mut out = DeviceBuf::alloc((n_tok * out_dim) as usize * 4).unwrap();
+
+        let iters = 50;
+        for (name, fp4) in [("int8 mma (q8_K acts)", false), ("fp4  mma (nvfp4 acts)", true)] {
+            // warm up and include the activation quantize, which the
+            // engine pays once per matmul either way
+            for _ in 0..3 {
+                if fp4 {
+                    quantize_nvfp4(&mut x4, &xf, in_dim, n_tok).unwrap();
+                    matmul_nvfp4_a4(&mut out, &w, &x4, in_dim, out_dim, n_tok, rb as u64).unwrap();
+                } else {
+                    quantize_q8_k(&mut x8, &xf, in_dim, n_tok).unwrap();
+                    matmul_kq(&mut out, &w, &x8, in_dim, out_dim, n_tok, rb as u64, QUANT_NVFP4).unwrap();
+                }
+            }
+            sync().unwrap();
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                if fp4 {
+                    matmul_nvfp4_a4(&mut out, &w, &x4, in_dim, out_dim, n_tok, rb as u64).unwrap();
+                } else {
+                    matmul_kq(&mut out, &w, &x8, in_dim, out_dim, n_tok, rb as u64, QUANT_NVFP4).unwrap();
+                }
+            }
+            sync().unwrap();
+            let ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
+            let gflop = 2.0 * out_dim as f64 * in_dim as f64 * n_tok as f64 / 1e9;
+            eprintln!("  {name}  {ms:8.3} ms  {:8.1} GFLOP/s", gflop / (ms * 1e-3));
+        }
+        }
+    }
+
+    /// Prefill attention at the qwen35 TP-shard shape (12 heads / 2 kv /
+    /// head_dim 256, one 128-token chunk against a deep f32 cache).
+    /// PULSAR_ATTN_TILE2=0/1 picks v1/v2 for A/B.
+    /// cargo test --release -p kernels gqa_tile_bench -- --ignored --nocapture
+    #[test]
+    #[ignore = "perf probe, requires a CUDA device"]
+    fn gqa_tile_bench() {
+        use super::*;
+        let (n_head, n_kv, hd, cap) = (12u32, 2u32, 256u32, 8192u32);
+        let (n_tok, pos0) = (128u32, 3500u32);
+        let scale = 1.0 / (hd as f32).sqrt();
+        let c_elems = (n_kv * cap * hd) as usize;
+        let q_elems = (n_tok * n_head * hd) as usize;
+        let rnd = |i: usize| ((i * 37) % 97) as f32 * 0.01 - 0.5;
+        let kc_h: Vec<f32> = (0..c_elems).map(rnd).collect();
+        let q_h: Vec<f32> = (0..q_elems).map(|i| rnd(i + 13)).collect();
+        let mut kc = DeviceBuf::alloc(c_elems * 4).unwrap();
+        let mut vc = DeviceBuf::alloc(c_elems * 4).unwrap();
+        let mut q = DeviceBuf::alloc(q_elems * 4).unwrap();
+        kc.write(0, as_bytes(&kc_h)).unwrap();
+        vc.write(0, as_bytes(&kc_h)).unwrap();
+        q.write(0, as_bytes(&q_h)).unwrap();
+        let mut out = DeviceBuf::alloc(q_elems * 4).unwrap();
+        /* PULSAR_BENCH_L2BUST=1: cycle 6 distinct cache pairs so L2 never
+         * retains K/V between launches - the production regime, where the
+         * FFN GEMMs stream GBs of weights between attention launches. */
+        let bust = std::env::var("PULSAR_BENCH_L2BUST").ok().as_deref() == Some("1");
+        let n_sets = if bust { 6 } else { 1 };
+        let mut sets: Vec<(DeviceBuf, DeviceBuf)> = Vec::new();
+        for _ in 0..n_sets {
+            let mut k2 = DeviceBuf::alloc(c_elems * 4).unwrap();
+            let mut v2 = DeviceBuf::alloc(c_elems * 4).unwrap();
+            k2.write(0, as_bytes(&kc_h)).unwrap();
+            v2.write(0, as_bytes(&kc_h)).unwrap();
+            sets.push((k2, v2));
+        }
+        let _ = (&kc, &vc);
+        for _ in 0..5 {
+            gqa_attention(&mut out, &q, &sets[0].0, &sets[0].1, n_tok, n_head, n_kv, hd, cap, pos0, scale, 0).unwrap();
+        }
+        sync().unwrap();
+        let iters = 60;
+        let t0 = std::time::Instant::now();
+        for i in 0..iters {
+            let (kx, vx) = &sets[i % n_sets];
+            gqa_attention(&mut out, &q, kx, vx, n_tok, n_head, n_kv, hd, cap, pos0, scale, 0).unwrap();
+        }
+        sync().unwrap();
+        let dt = t0.elapsed().as_secs_f64() / iters as f64;
+        let rows = (pos0 + n_tok / 2) as f64; // avg visible rows per query
+        let flops = 4.0 * rows * hd as f64 * n_tok as f64 * n_head as f64; // qk + pv
+        eprintln!(
+            "gqa tile bench (tile2={}): {:7.0} us, {:5.2} TFLOP/s",
+            std::env::var("PULSAR_ATTN_TILE2").unwrap_or_else(|_| "default".into()),
+            dt * 1e6,
+            flops / dt / 1e12
+        );
     }
 
     /// cargo test --release -p kernels kq_gemm_bench -- --ignored --nocapture
@@ -1819,5 +2526,25 @@ mod tests {
         for (i, &v) in y.iter().enumerate() {
             assert_eq!(v, 3.0 * i as f32);
         }
+    }
+
+    /// Weight VRAM budget: exhausted -> pinned host fallback; refilled ->
+    /// VRAM again. Same bytes either way.
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn weight_budget_pins_overflow() {
+        const DEV: i32 = 0;
+        super::set_device(DEV).unwrap();
+        let data = vec![7u8; 4096];
+        super::set_weight_vram_budget(DEV, 0);
+        let p = super::DeviceBuf::from_bytes(&data).unwrap();
+        assert!(p.is_pinned());
+        let mut back = vec![0u8; 4096];
+        p.read(0, &mut back).unwrap();
+        assert_eq!(back[0], 7);
+        super::set_weight_vram_budget(DEV, 1 << 20);
+        let v = super::DeviceBuf::from_bytes(&data).unwrap();
+        assert!(!v.is_pinned());
+        super::set_weight_vram_budget(DEV, i64::MAX);
     }
 }

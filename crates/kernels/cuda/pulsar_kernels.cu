@@ -463,12 +463,30 @@ static void *preq_scratch(uint64_t bytes) {
     (void)cudaGetDevice(&dev);
     if (dev < 0 || dev >= PULSAR_MAX_DEVICES) return NULL;
     if (bytes <= g_preq_scratch_cap[dev]) return g_preq_scratch[dev];
+    /* cudaMalloc is illegal mid graph-capture and pulsar captures the
+     * GDN+FFN chain (qwen35 graphs); grow only outside capture, with a
+     * floor so it happens once - a later grow would cudaFree the
+     * pointer already baked into captured graphs. Capture-time callers
+     * prewarm via pulsar_preq_scratch_reserve before Graph::capture. */
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(cudaStreamPerThread, &cap) != cudaSuccess ||
+        cap != cudaStreamCaptureStatusNone) {
+        return NULL;
+    }
+    const uint64_t floor_bytes = 64u << 20;
+    if (bytes < floor_bytes) bytes = floor_bytes;
     if (g_preq_scratch[dev]) (void)cudaFree(g_preq_scratch[dev]);
     g_preq_scratch[dev] = NULL;
     g_preq_scratch_cap[dev] = 0;
     if (!cuda_ok(cudaMalloc(&g_preq_scratch[dev], bytes), "preq scratch alloc")) return NULL;
     g_preq_scratch_cap[dev] = bytes;
     return g_preq_scratch[dev];
+}
+
+/* prewarm the per-device preq scratch OUTSIDE any graph capture, so
+ * the first matmul_q8_0 inside the capture hits the cached pointer */
+extern "C" int pulsar_preq_scratch_reserve(uint64_t bytes) {
+    return preq_scratch(bytes) != NULL;
 }
 
 extern "C" int pulsar_q8_0_matmul(
@@ -655,6 +673,7 @@ static int q8_0_matmul_selftest_one(uint32_t n_tok) {
              cuda_ok(cudaMalloc(&out_dev, o_bytes), "out alloc") &&
              cuda_ok(cudaMemcpy(w_dev, w, w_bytes, cudaMemcpyHostToDevice), "w h2d") &&
              cuda_ok(cudaMemcpy(x_dev, x, x_bytes, cudaMemcpyHostToDevice), "x h2d") &&
+             pulsar_preq_scratch_reserve((uint64_t)n_tok * in_dim + 64u) &&
              pulsar_q8_0_matmul(out_dev, w_dev, x_dev, in_dim, out_dim, n_tok) &&
              cuda_ok(cudaDeviceSynchronize(), "sync") &&
              cuda_ok(cudaMemcpy(gpu, out_dev, o_bytes, cudaMemcpyDeviceToHost), "d2h");
@@ -2321,6 +2340,24 @@ struct wdot_nvfp4 {
         const int sb = __dp4a(p.vb, *(const int32_t *)(yb->qs + p.off + 8), 0);
         return p.dl * yb->d * (float)(sa + sb);
     }
+    /* The activation words a lane touches are fixed by the LANE, not by
+     * the weight row (see prepare: off is a pure function of lane), so a
+     * warp holding several rows can load them once and reuse. */
+    struct Act { int32_t a, b; float d; };
+    __device__ __forceinline__ static uint32_t act_off(uint32_t lane) {
+        const uint32_t nb = lane >> 3, sub = (lane >> 1) & 3u, h = lane & 1u;
+        return nb * 64 + sub * 16 + h * 4;
+    }
+    __device__ __forceinline__ static Act act(const block_q8_K *y, uint32_t off) {
+        Act a;
+        a.a = *(const int32_t *)(y->qs + off);
+        a.b = *(const int32_t *)(y->qs + off + 8);
+        a.d = y->d;
+        return a;
+    }
+    __device__ __forceinline__ static float apply_act(const Prep &p, const Act &y) {
+        return p.dl * y.d * (float)(__dp4a(p.va, y.a, 0) + __dp4a(p.vb, y.b, 0));
+    }
     __device__ __forceinline__ static float block(const char *row, const block_q8_K *xq, uint32_t b, uint32_t lane) {
         return apply(prepare(row, b, lane), xq, b, lane);
     }
@@ -3009,6 +3046,33 @@ struct unpack_q6_K {
     }
 };
 
+/* nvfp4 for the MMA path: 144B superblock = 4 blocks x 36B, each block
+ * 4 UE4M3 scale bytes then 32 nibble bytes. chunk c of 16 values maps to
+ * block c>>2, sub-block c&3; within a sub-block the low nibbles are
+ * values 0..7 and the high nibbles 8..15, so the two 4-byte words give
+ * out[0]=v0..3, out[1]=v4..7 (lows) and out[2]=v8..11, out[3]=v12..15
+ * (highs). The doubled-e2m1 codebook decodes to int8 and ue4m3_half
+ * carries the compensating 0.5, so there is no min term. */
+struct unpack_nvfp4 {
+    static const bool HAS_MIN = false;
+    static const uint32_t SB_BYTES = 144u;
+    __device__ __forceinline__ static void chunk16(
+            const char *block, uint32_t c, int32_t out[4], float *scale, float *minoff) {
+        (void)minoff;
+        const uint32_t nb = c >> 2, sub = c & 3u;
+        const char *bp = block + (uint64_t)nb * 36u;
+        uint8_t e;
+        memcpy(&e, bp + sub, 1);
+        *scale = ue4m3_half(e);
+        const uint32_t w0 = load_u32_bytes((const uint8_t *)(bp + 4u + sub * 8u));
+        const uint32_t w1 = load_u32_bytes((const uint8_t *)(bp + 4u + sub * 8u + 4u));
+        out[0] = mxfp4_lookup4(w0 & 0x0f0f0f0fu);
+        out[1] = mxfp4_lookup4(w1 & 0x0f0f0f0fu);
+        out[2] = mxfp4_lookup4((w0 >> 4) & 0x0f0f0f0fu);
+        out[3] = mxfp4_lookup4((w1 >> 4) & 0x0f0f0f0fu);
+    }
+};
+
 struct unpack_q4_K {
     static const bool HAS_MIN = true;
     static const uint32_t SB_BYTES = sizeof(block_q4_K);
@@ -3575,6 +3639,86 @@ __global__ static void matmul_kqw_tokens_kernel(
     }
 }
 
+
+/* Row-tiled token kernel: each warp owns R rows for all TT tokens.
+ * One-row-per-warp made every warp re-read the same staged activation
+ * words for its single row, and ncu had that kernel at L1 94% / DRAM
+ * 28% - starved on load-store throughput, not on memory. Hoisting the
+ * activation into registers once per (block, token) and reusing it
+ * across R rows cuts the shared traffic per weight byte by R while the
+ * weight reads, which are the traffic we actually want, stay put. */
+template <typename WDOT, int TT, int R>
+__global__ static void matmul_kqw_rows_kernel(
+        float *out,
+        const char *w,
+        const block_q8_K *xq,
+        uint32_t in_blocks,
+        uint32_t out_dim,
+        uint32_t n_tok,
+        uint64_t row_bytes) {
+    const uint32_t lane = threadIdx.x;
+    const uint32_t row0 = (blockIdx.x * blockDim.y + threadIdx.y) * (uint32_t)R;
+    constexpr uint32_t QW = sizeof(block_q8_K) / 4u;
+    __shared__ uint32_t xs[TT * QW];
+    const uint32_t tid = threadIdx.y * blockDim.x + lane;
+    const uint32_t nthr = blockDim.y * blockDim.x;
+
+    /* clamp out-of-range rows onto the last one: the staging loop below
+     * has __syncthreads(), so no warp may return early */
+    const char *wr[R];
+    #pragma unroll
+    for (int r = 0; r < R; r++) {
+        const uint32_t rr = (row0 + (uint32_t)r) < out_dim ? (row0 + (uint32_t)r) : (out_dim - 1u);
+        wr[r] = w + (uint64_t)rr * row_bytes;
+    }
+    float acc[R][TT];
+    #pragma unroll
+    for (int r = 0; r < R; r++)
+        #pragma unroll
+        for (int t = 0; t < TT; t++) acc[r][t] = 0.0f;
+
+    const uint32_t off = WDOT::act_off(lane);
+    for (uint32_t b = 0; b < in_blocks; b++) {
+        const uint32_t total = n_tok * QW;
+        for (uint32_t i = tid; i < total; i += nthr) {
+            const uint32_t t = i / QW;
+            xs[i] = ((const uint32_t *)(xq + (uint64_t)t * in_blocks + b))[i - t * QW];
+        }
+        __syncthreads();
+        typename WDOT::Act ya[TT];
+        #pragma unroll
+        for (int t = 0; t < TT; t++) {
+            if ((uint32_t)t >= n_tok) break;
+            ya[t] = WDOT::act((const block_q8_K *)xs + t, off);
+        }
+        #pragma unroll
+        for (int r = 0; r < R; r++) {
+            const typename WDOT::Prep p = WDOT::prepare(wr[r], b, lane);
+            #pragma unroll
+            for (int t = 0; t < TT; t++) {
+                if ((uint32_t)t >= n_tok) break;
+                acc[r][t] += WDOT::apply_act(p, ya[t]);
+            }
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int r = 0; r < R; r++) {
+        #pragma unroll
+        for (int t = 0; t < TT; t++) {
+            if ((uint32_t)t >= n_tok) break;
+            float a = acc[r][t];
+            #pragma unroll
+            for (uint32_t mask = 16u; mask > 0u; mask >>= 1u) {
+                a += __shfl_xor_sync(0xffffffffu, a, mask);
+            }
+            if (lane == 0 && (row0 + (uint32_t)r) < out_dim) {
+                out[(uint64_t)t * out_dim + row0 + (uint32_t)r] = a;
+            }
+        }
+    }
+}
+
 /* Token-tiled variant: one warp owns a row for ALL TT tokens, so the
  * row bytes are read once (L1-hot across the register token loop)
  * instead of once per token - on a 248k-row lm head the legacy grid
@@ -3846,6 +3990,66 @@ __global__ static void matmul_kq_gemm_q6K(
 }
 
 
+
+/* Octet-major q8_K activations for the prefill GEMM.
+ *
+ * The GEMM's B fragment has lane (g, tg) reading token tb+g at chunk
+ * offset tg*4, so one load reaches 8 different token rows a whole q8_K
+ * row apart (in_blocks * 292 bytes) and touches 8 cache lines. The FP4
+ * GEMM had exactly this defect and fixing it there was worth 1.47x,
+ * more than ldmatrix and wider tiles combined.
+ *
+ * This lays a warp's 8 tokens side by side: per (octet, superblock),
+ * 16 chunks of [8 tokens x 16 bytes] followed by the 8 f32 scales. A
+ * warp's whole B read for one chunk is then 128 contiguous bytes, one
+ * cache line instead of eight. Pure data movement, so the arithmetic
+ * and the output are unchanged. */
+#define PULSAR_OCT_TILE 2080u   /* 16*128 qs + 8*4 d */
+
+__global__ static void q8K_to_octet_kernel(
+        char *out, const block_q8_K *xq, uint32_t in_blocks, uint32_t n_tok) {
+    const uint32_t sb = blockIdx.x, oct = blockIdx.y;
+    char *dst = out + ((uint64_t)oct * in_blocks + sb) * PULSAR_OCT_TILE;
+    for (uint32_t i = threadIdx.x; i < 8u * 64u; i += 256u) {
+        const uint32_t r = i >> 6, w = i & 63u;
+        const uint32_t tk = oct * 8u + r;
+        const block_q8_K *blk = xq + (uint64_t)(tk < n_tok ? tk : n_tok - 1u) * in_blocks + sb;
+        const int32_t v = *(const int32_t *)(blk->qs + w * 4u);
+        /* qs[w*4] belongs to chunk w>>2, quad w&3 */
+        *(int32_t *)(dst + (w >> 2) * 128u + r * 16u + (w & 3u) * 4u) = v;
+    }
+    if (threadIdx.x < 8u) {
+        const uint32_t tk = oct * 8u + threadIdx.x;
+        *(float *)(dst + 2048u + threadIdx.x * 4u) =
+                (xq + (uint64_t)(tk < n_tok ? tk : n_tok - 1u) * in_blocks + sb)->d;
+    }
+}
+
+static void *g_oct_scratch[16];
+static uint64_t g_oct_cap[16];
+
+static void *oct_scratch(uint64_t bytes) {
+    int dev = 0;
+    (void)cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 16) return NULL;
+    if (bytes <= g_oct_cap[dev]) return g_oct_scratch[dev];
+    /* cudaMalloc is illegal mid graph-capture and pulsar captures the
+     * forward; grow only outside capture, with a floor so it happens once */
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(cudaStreamPerThread, &cap) != cudaSuccess ||
+        cap != cudaStreamCaptureStatusNone) {
+        return NULL;
+    }
+    const uint64_t floor_bytes = 128u << 20;
+    if (bytes < floor_bytes) bytes = floor_bytes;
+    if (g_oct_scratch[dev]) (void)cudaFree(g_oct_scratch[dev]);
+    g_oct_scratch[dev] = NULL;
+    g_oct_cap[dev] = 0;
+    if (!cuda_ok(cudaMalloc(&g_oct_scratch[dev], bytes), "oct scratch")) return NULL;
+    g_oct_cap[dev] = bytes;
+    return g_oct_scratch[dev];
+}
+
 /* tensor-core flavor of the prefill GEMM (sm_80+). Reuses the MoE MMA
  * machinery - the UNPACK::chunk16 dequant policies and the m16n8k16
  * fragment mapping - minus the pair/gather bookkeeping: B columns are
@@ -3878,7 +4082,10 @@ __device__ __forceinline__ static void ldmatrix_x2(
  * banks (256 would land every row on bank 0) */
 #define PULSAR_GEMM_AS 272u
 
-template <typename UNPACK>
+/* OCT is a template parameter, not a runtime pointer test: the B read
+ * sits in the innermost loop and a runtime select there measured ~4%
+ * even when never taken. */
+template <typename UNPACK, bool OCT>
 __global__ static void matmul_kq_gemm_mma_kernel(
         float *out,
         const char *w,
@@ -3886,7 +4093,8 @@ __global__ static void matmul_kq_gemm_mma_kernel(
         uint32_t in_blocks,
         uint32_t out_dim,
         uint32_t n_tok,
-        uint64_t row_bytes) {
+        uint64_t row_bytes,
+        const char *yoct) {   /* octet-major B, NULL = read q8_K rows */
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     const uint32_t r0 = blockIdx.x * 32u;
     const uint32_t tok0 = blockIdx.y * 64u;
@@ -3949,8 +4157,15 @@ __global__ static void matmul_kq_gemm_mma_kernel(
         const char *ybs = yb + (uint64_t)sb * sizeof(block_q8_K);
         const char *yc0s = yc0 ? yc0 + (uint64_t)sb * sizeof(block_q8_K) : NULL;
         const char *yc1s = yc1 ? yc1 + (uint64_t)sb * sizeof(block_q8_K) : NULL;
-        const float d0 = yc0s ? ((const block_q8_K *)yc0s)->d : 0.0f;
-        const float d1 = yc1s ? ((const block_q8_K *)yc1s)->d : 0.0f;
+        /* octet tile: the warp's 8 tokens laid side by side, so the B
+         * read below is one cache line rather than eight */
+        const char *obs = OCT
+                ? yoct + ((uint64_t)(tb >> 3) * in_blocks + sb) * PULSAR_OCT_TILE
+                : NULL;
+        const float d0 = OCT ? *(const float *)(obs + 2048u + tg * 8u)
+                             : (yc0s ? ((const block_q8_K *)yc0s)->d : 0.0f);
+        const float d1 = OCT ? *(const float *)(obs + 2048u + tg * 8u + 4u)
+                             : (yc1s ? ((const block_q8_K *)yc1s)->d : 0.0f);
 
         /* ncu: MIO-queue stalls were 35% of warp wait when this loop
          * was narrow 32-bit smem loads. Scales come 4 chunks per
@@ -3973,7 +4188,9 @@ __global__ static void matmul_kq_gemm_mma_kernel(
             #pragma unroll
             for (uint32_t chi = 0; chi < 4u; chi++) {
                 const uint32_t ch = ch4 * 4u + chi;
-                const int32_t b = *(const int32_t *)(ybs + 4u + ch * 16u + tg * 4u);
+                const int32_t b = OCT
+                        ? *(const int32_t *)(obs + ch * 128u + g * 16u + tg * 4u)
+                        : *(const int32_t *)(ybs + 4u + ch * 16u + tg * 4u);
                 if (UNPACK::HAS_MIN) {
                     const float bs0 = yc0s ? (float)((const int16_t *)(yc0s + 4u + 256u))[ch] * d0 : 0.0f;
                     const float bs1 = yc1s ? (float)((const int16_t *)(yc1s + 4u + 256u))[ch] * d1 : 0.0f;
@@ -4022,6 +4239,518 @@ __global__ static void matmul_kq_gemm_mma_kernel(
 #endif
 }
 
+
+/* NVFP4 flavor of the prefill GEMM. Layout: 144B per 256-value
+ * superblock = 4 blocks x 36B, each block holding 4 UE4M3 scale bytes
+ * then 32 nibble bytes; within a 16-value sub-block the low nibbles are
+ * values 0..7 and the high nibbles 8..15. The doubled-e2m1 codebook
+ * (mxfp4_lookup4) decodes straight to int8 and ue4m3_half carries the
+ * compensating 0.5, so this rides the same per-16-scale frame as q6_K
+ * with no min term. */
+__global__ static void matmul_kq_gemm_nvfp4(
+        float *out,
+        const char *w,
+        const block_q8_K *xq,
+        uint32_t in_blocks,
+        uint32_t out_dim,
+        uint32_t n_tok,
+        uint64_t row_bytes) {
+    __shared__ int8_t wq_s[PULSAR_GEMM_BM * PULSAR_GEMM_WS];
+    __shared__ int8_t yq_s[PULSAR_GEMM_BN * PULSAR_GEMM_YS];
+    __shared__ float wsc_s[PULSAR_GEMM_BM][16];
+    __shared__ float yd_s[PULSAR_GEMM_BN];
+
+    const uint32_t tx = threadIdx.x;
+    const uint32_t ty = threadIdx.y;
+    const uint32_t tid = ty * 64u + tx;
+    const uint32_t row0 = blockIdx.x * PULSAR_GEMM_BM;
+    const uint32_t tok0 = blockIdx.y * PULSAR_GEMM_BN;
+    const uint32_t tok = tok0 + tx;
+
+    float acc[8];
+    #pragma unroll
+    for (int r = 0; r < 8; r++) acc[r] = 0.0f;
+
+    for (uint32_t b = 0; b < in_blocks; b++) {
+        {
+            const uint32_t r = tid >> 3;
+            const uint32_t j5 = tid & 7u;
+            const uint32_t rg = row0 + r < out_dim ? row0 + r : out_dim - 1u;
+            /* thread j5 -> block nb, sub-block pair sp: 2 subs x 2 halves */
+            const uint32_t nb = j5 >> 1, sp = j5 & 1u;
+            const char *bp = w + (uint64_t)rg * row_bytes + (uint64_t)b * 144u
+                    + (uint64_t)nb * 36u;
+            #pragma unroll
+            for (uint32_t si = 0; si < 2u; si++) {
+                const uint32_t sub = sp * 2u + si;
+                uint8_t e;
+                memcpy(&e, bp + sub, 1);
+                wsc_s[r][nb * 4u + sub] = ue4m3_half(e);
+                #pragma unroll
+                for (uint32_t h = 0; h < 2u; h++) {
+                    const uint32_t v = *(const uint32_t *)(bp + 4u + sub * 8u + h * 4u);
+                    const int32_t lo = mxfp4_lookup4(v & 0x0f0f0f0fu);
+                    const int32_t hi = mxfp4_lookup4((v >> 4) & 0x0f0f0f0fu);
+                    int8_t *dst = wq_s + r * PULSAR_GEMM_WS + nb * 64u + sub * 16u + h * 4u;
+                    *(int32_t *)dst = lo;
+                    *(int32_t *)(dst + 8) = hi;
+                }
+            }
+        }
+        {
+            const uint32_t t = tid >> 2;
+            const uint32_t q = tid & 3u;
+            const uint32_t tg = tok0 + t < n_tok ? tok0 + t : n_tok - 1u;
+            const block_q8_K *yb = xq + (uint64_t)tg * in_blocks + b;
+            const uint8_t *src = (const uint8_t *)yb->qs + 64u * q;
+            int8_t *dst = yq_s + t * PULSAR_GEMM_YS + 64u * q;
+            #pragma unroll
+            for (int i = 0; i < 64; i += 4)
+                *(uint32_t *)(dst + i) = *(const uint32_t *)(src + i);
+            if (q == 0u) yd_s[t] = yb->d;
+        }
+        __syncthreads();
+
+        const int8_t *yrow = yq_s + tx * PULSAR_GEMM_YS;
+        const float ydv = yd_s[tx];
+        #pragma unroll
+        for (uint32_t k = 0; k < 16u; k++) {
+            int yw[4];
+            #pragma unroll
+            for (int i = 0; i < 4; i++)
+                yw[i] = *(const int32_t *)(yrow + 16u * k + 4u * i);
+            #pragma unroll
+            for (int r = 0; r < 8; r++) {
+                const uint32_t rl = ty * 8u + r;
+                const int8_t *wr_ = wq_s + rl * PULSAR_GEMM_WS + 16u * k;
+                int sg = 0;
+                #pragma unroll
+                for (int i = 0; i < 4; i++)
+                    sg = __dp4a(*(const int32_t *)(wr_ + 4 * i), yw[i], sg);
+                acc[r] += ydv * wsc_s[rl][k] * (float)sg;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tok < n_tok) {
+        #pragma unroll
+        for (int r = 0; r < 8; r++) {
+            const uint32_t rg = row0 + ty * 8u + r;
+            if (rg < out_dim) out[(uint64_t)tok * out_dim + rg] = acc[r];
+        }
+    }
+}
+
+
+/* ---- native Blackwell FP4 path (W4A4) ------------------------------
+ * docs/blackwell-fp4-mma.md records the measured semantics this rests
+ * on. One 36-byte NVFP4 block is 64 values carrying four ue4m3 scales,
+ * which is exactly one m16n8k64 mma with scale_vec::4X, so weights feed
+ * the tensor core straight from the file: no dequant, no lookup table.
+ * A matmul does not care what order it sums k in, so quantizing
+ * activations into the SAME block format makes both operands raw 32-bit
+ * loads and no nibble shuffle is needed on either side. Measured 419
+ * TOPS here against 105 for the int8 m16n8k16 path this replaces. */
+/* high bit of the quant word: caller permits W4A4 at this call site */
+#define PULSAR_QUANT_A4_OK 0x80000000u
+#define PULSAR_NVFP4_SB_BYTES  144u   /* 256 values: 4 blocks x 36B */
+#define PULSAR_NVFP4_BLK_BYTES  36u   /* 64 values: 4 scales + 32 nibble */
+/* Activations use the same 4-bit encoding but an octet-major tile: per
+ * 8 tokens and superblock, four k-blocks of [8 rows x 32 nibble bytes]
+ * then [8 scale words]. A warp's whole B fragment is then one
+ * contiguous 288-byte region instead of eight rows 2304B apart, which
+ * is the difference between 8 cache lines per load and 2. Weights keep
+ * the on-disk layout; only activations, which we quantize ourselves,
+ * are free to be reordered. */
+#define PULSAR_NVFP4_ACT_TILE 1152u   /* 8 tokens x one 144B superblock */
+#define PULSAR_NVFP4_ACT_BLK   288u   /* 8x32 nibble bytes + 8 scale words */
+
+#if defined(__CUDA_ARCH_FEAT_SM120_ALL)
+/* arch-specific: plain sm_120 rejects .kind::mxf4nvf4 outright */
+__device__ __forceinline__ static void mma_nvfp4_16x8x64(
+        float d[4], const uint32_t a[4], const uint32_t b[2],
+        uint32_t sa, uint32_t sb) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale."
+        "scale_vec::4X.f32.e2m1.e2m1.f32.ue4m3 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, "
+        "%10, {0, 0}, %11, {0, 0};"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+          "r"(b[0]), "r"(b[1]), "r"(sa), "r"(sb));
+}
+#endif
+
+/* OCP e4m3 with the sign bit unused, matching ue4m3_half's decode. 0x7F
+ * is NaN in hardware (ggml reads it as zero), so the encoder never emits
+ * it: the top finite code is 0x7E = 448. */
+__device__ __forceinline__ static uint8_t e4m3_encode(float s) {
+    if (!(s > 0.0f)) return 0;
+    if (s >= 448.0f) return 0x7E;
+    if (s < ldexpf(1.0f, -9)) return 0;
+    int e;
+    const float m = frexpf(s, &e);          /* s = m * 2^e, m in [0.5,1) */
+    int E = e - 1 + 7;
+    int M = (int)rintf((2.0f * m - 1.0f) * 8.0f);
+    if (M == 8) { M = 0; E++; }
+    if (E <= 0) {                            /* subnormal: s = man * 2^-9 */
+        int man = (int)rintf(ldexpf(s, 9));
+        return (uint8_t)(man > 7 ? 7 : man);
+    }
+    if (E > 15) { E = 15; M = 6; }
+    if (E == 15 && M > 6) M = 6;
+    return (uint8_t)((E << 3) | M);
+}
+
+/* nearest e2m1 code; magnitudes {0,.5,1,1.5,2,3,4,6}, bit 3 is sign */
+__device__ __forceinline__ static uint32_t e2m1_encode(float x) {
+    const float a = fabsf(x);
+    uint32_t c;
+    if (a < 0.25f) c = 0;
+    else if (a < 0.75f) c = 1;
+    else if (a < 1.25f) c = 2;
+    else if (a < 1.75f) c = 3;
+    else if (a < 2.5f) c = 4;
+    else if (a < 3.5f) c = 5;
+    else if (a < 5.0f) c = 6;
+    else c = 7;
+    return (x < 0.0f ? 8u : 0u) | c;
+}
+
+/* f32 -> NVFP4 in the identical block format the weights ship in, one
+ * thread per 16-value sub-block. Scales are absolute (the format carries
+ * no per-tensor factor), so a window whose absmax exceeds 6*448 = 2688
+ * saturates.
+ * ponytail: saturation is fine for hidden states; add a per-token global
+ * scale (it factors out of the mma as a per-column constant) if a model
+ * ever trips it. */
+__global__ static void nvfp4_quantize_kernel(
+        uint8_t *out, const float *x, uint32_t in_dim, uint32_t n_sub,
+        uint32_t n_rows) {
+    const uint32_t sub = blockIdx.x * blockDim.x + threadIdx.x;
+    if (sub >= n_sub) return;
+    /* rows round up to a whole octet; padding rows re-quantize the last
+     * real token rather than being left uninitialized, so no stale 0x7F
+     * can reach the mma as a NaN scale */
+    const uint32_t t = blockIdx.y;
+    const uint32_t src_row = t < n_rows ? t : n_rows - 1u;
+    const float *src = x + (uint64_t)src_row * in_dim + (uint64_t)sub * 16u;
+
+    float amax = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 16; i++) amax = fmaxf(amax, fabsf(src[i]));
+
+    const uint8_t e = e4m3_encode(amax * (1.0f / 6.0f));
+    const uint32_t sb = sub >> 4, kb = (sub >> 2) & 3u, sq = sub & 3u;
+    const uint32_t o = t >> 3, r = t & 7u;
+    uint8_t *base = out
+            + ((uint64_t)o * (in_dim / 256u) + sb) * PULSAR_NVFP4_ACT_TILE
+            + (uint64_t)kb * PULSAR_NVFP4_ACT_BLK;
+    base[256u + r * 4u + sq] = e;
+
+    /* ue4m3_half carries the *0.5 that compensates the doubled codebook;
+     * the hardware uses the true e2m1 values, so undo it here */
+    const float dec = ue4m3_half(e) * 2.0f;
+    const float inv = dec > 0.0f ? 1.0f / dec : 0.0f;
+    uint8_t *q = base + r * 32u + sq * 8u;
+    #pragma unroll
+    for (int i = 0; i < 8; i++)
+        q[i] = (uint8_t)(e2m1_encode(src[i] * inv)
+                         | (e2m1_encode(src[i + 8] * inv) << 4));
+}
+
+/* Same block/warp shape as the int8 prefill GEMM: 32 rows x 64 tokens,
+ * 8 warps each owning one token octet, which is exactly the mma's n=8.
+ * The smem stage is now a pure copy - no dequant - and a 36-word row
+ * stride lands lane (g,l) on bank g*4+l, so all 32 banks stay distinct. */
+__global__ static void matmul_nvfp4_a4_kernel(
+        float *out,
+        const char *w,
+        const char *xq,
+        uint32_t in_blocks,
+        uint32_t out_dim,
+        uint32_t n_tok,
+        uint64_t row_bytes) {
+#if defined(__CUDA_ARCH_FEAT_SM120_ALL)
+    const uint32_t r0 = blockIdx.x * 32u;
+    const uint32_t tok0 = blockIdx.y * 128u;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t g = lane >> 2u;   /* fragment row / B column */
+    const uint32_t l = lane & 3u;    /* k quad / D column pair */
+    /* ldmatrix addressing: lane supplies row (lane&7) of matrix lane>>3 */
+    const uint32_t lm = lane >> 3u, lr = lane & 7u;
+
+    /* Nibbles and scales stage separately so the nibble rows stay 16B
+     * aligned for ldmatrix: the four scale bytes at the head of every
+     * 36-byte block would otherwise skew every row to 4 mod 16. A
+     * 36-word stride is 144B, a multiple of 16, and still lands the 8
+     * rows of an ldmatrix matrix on distinct banks. */
+    __shared__ uint32_t a_q[2][32][36];
+    __shared__ uint32_t a_sc[2][32][4];
+
+    float acc[16];
+    #pragma unroll
+    for (int i = 0; i < 16; i++) acc[i] = 0.0f;
+
+    /* a warp owns 16 tokens as two octets; one A fragment feeds both, so
+     * the ldmatrix and the weight tile amortize over twice the work */
+    const uint32_t tb = tok0 + warp * 16u;
+    /* clamped, not NULL: B rides an always-valid row so the inner loop
+     * carries no guard; out-of-range tokens only skip the store */
+    const uint32_t n_oct = (n_tok + 7u) >> 3;
+    const uint32_t o0 = (tb >> 3) < n_oct ? (tb >> 3) : n_oct - 1u;
+    const uint32_t o1 = ((tb + 8u) >> 3) < n_oct ? ((tb + 8u) >> 3) : n_oct - 1u;
+    const char *yb0 = xq + (uint64_t)o0 * in_blocks * PULSAR_NVFP4_ACT_TILE;
+    const char *yb1 = xq + (uint64_t)o1 * in_blocks * PULSAR_NVFP4_ACT_TILE;
+
+#define PULSAR_NVFP4_STAGE(buf, sb)                                            \
+    do {                                                                       \
+        for (uint32_t i = threadIdx.x; i < 32u * 36u; i += 256u) {             \
+            const uint32_t r = i / 36u, wd = i - r * 36u;                      \
+            const uint32_t rg = r0 + r < out_dim ? r0 + r : out_dim - 1u;      \
+            const uint32_t v = *(const uint32_t *)(w + (uint64_t)rg * row_bytes \
+                    + (uint64_t)(sb) * PULSAR_NVFP4_SB_BYTES + wd * 4u);       \
+            const uint32_t bk = wd / 9u, j = wd - bk * 9u;                     \
+            if (j == 0u) a_sc[buf][r][bk] = v;                                 \
+            else a_q[buf][r][bk * 8u + j - 1u] = v;                            \
+        }                                                                      \
+    } while (0)
+
+    PULSAR_NVFP4_STAGE(0u, 0u);
+    __syncthreads();
+
+    for (uint32_t sb = 0; sb < in_blocks; sb++) {
+        const uint32_t cur = sb & 1u;
+        if (sb + 1u < in_blocks) PULSAR_NVFP4_STAGE(cur ^ 1u, sb + 1u);
+        const char *ybs0 = yb0 + (uint64_t)sb * PULSAR_NVFP4_ACT_TILE;
+        const char *ybs1 = yb1 + (uint64_t)sb * PULSAR_NVFP4_ACT_TILE;
+
+        #pragma unroll
+        for (uint32_t kb = 0; kb < 4u; kb++) {
+            /* word 0 of a block is its 4 scale bytes, words 1..8 the
+             * nibbles; reg0 covers k [8l,8l+8), reg2 the same 32 later */
+            const char *blk0 = ybs0 + kb * PULSAR_NVFP4_ACT_BLK;
+            const char *blk1 = ybs1 + kb * PULSAR_NVFP4_ACT_BLK;
+            uint32_t b0[2], b1[2];
+            b0[0] = *(const uint32_t *)(blk0 + g * 32u + l * 4u);
+            b0[1] = *(const uint32_t *)(blk0 + g * 32u + 16u + l * 4u);
+            b1[0] = *(const uint32_t *)(blk1 + g * 32u + l * 4u);
+            b1[1] = *(const uint32_t *)(blk1 + g * 32u + 16u + l * 4u);
+            const uint32_t sbw0 = *(const uint32_t *)(blk0 + 256u + g * 4u);
+            const uint32_t sbw1 = *(const uint32_t *)(blk1 + 256u + g * 4u);
+            #pragma unroll
+            for (uint32_t h = 0; h < 2u; h++) {
+                /* all four A registers in one instruction instead of
+                 * four narrow smem loads: matrix m covers rows
+                 * 16h + 8*(m&1) + 0..7 at byte 16*(m>>1), which is
+                 * exactly the m16n8k64 A fragment */
+                uint32_t a[4];
+                ldmatrix_x4(a, &a_q[cur][16u * h + lr + 8u * (lm & 1u)]
+                                        [kb * 8u + 4u * (lm >> 1u)]);
+                /* row r's scales come from lane (r&7)*4 + (r>>3), i.e.
+                 * this lane feeds row g + 8l and only l < 2 is read;
+                 * l&1 keeps the index in range for the l >= 2 lanes */
+                const uint32_t saw = a_sc[cur][16u * h + g + 8u * (l & 1u)][kb];
+                mma_nvfp4_16x8x64(&acc[8u * h], a, b0, saw, sbw0);
+                mma_nvfp4_16x8x64(&acc[8u * h + 4u], a, b1, saw, sbw1);
+            }
+        }
+        __syncthreads();
+    }
+#undef PULSAR_NVFP4_STAGE
+
+    #pragma unroll
+    for (uint32_t h = 0; h < 2u; h++) {
+        const uint32_t rg0 = r0 + 16u * h + g, rg8 = rg0 + 8u;
+        #pragma unroll
+        for (uint32_t o = 0; o < 2u; o++) {
+            const uint32_t base = 8u * h + 4u * o;
+            const uint32_t t0 = tb + 8u * o + l * 2u, t1 = t0 + 1u;
+            if (t0 < n_tok) {
+                if (rg0 < out_dim) out[(uint64_t)t0 * out_dim + rg0] = acc[base + 0u];
+                if (rg8 < out_dim) out[(uint64_t)t0 * out_dim + rg8] = acc[base + 2u];
+            }
+            if (t1 < n_tok) {
+                if (rg0 < out_dim) out[(uint64_t)t1 * out_dim + rg0] = acc[base + 1u];
+                if (rg8 < out_dim) out[(uint64_t)t1 * out_dim + rg8] = acc[base + 3u];
+            }
+        }
+    }
+#else
+    (void)out; (void)w; (void)xq; (void)in_blocks;
+    (void)out_dim; (void)n_tok; (void)row_bytes;
+#endif
+}
+
+/* exposed so the Rust selftest can skip on non-Blackwell devices */
+extern "C" int pulsar_cc_major(void) { return pulsar_device_cc_major(); }
+
+
+/* q8_K activations -> NVFP4, so the FP4 GEMM can be reached without
+ * touching a single engine call site: every caller already hands
+ * matmul_kq a q8_K buffer. The direct f32 path (pulsar_quantize_nvfp4)
+ * is one rounding step better and is what a later engine-level wiring
+ * should use; this converts what is already there.
+ * Layout is the octet-major activation tile the GEMM expects. */
+__global__ static void nvfp4_from_q8K_kernel(
+        uint8_t *out, const block_q8_K *xq, uint32_t in_dim,
+        uint32_t n_sub, uint32_t n_rows) {
+    const uint32_t sub = blockIdx.x * blockDim.x + threadIdx.x;
+    if (sub >= n_sub) return;
+    const uint32_t t = blockIdx.y;
+    const uint32_t src_row = t < n_rows ? t : n_rows - 1u;
+    const uint32_t in_blocks = in_dim / 256u;
+    const uint32_t sb = sub >> 4, loc = sub & 15u;
+    const block_q8_K *blk = xq + (uint64_t)src_row * in_blocks + sb;
+    const int8_t *qs = blk->qs + loc * 16u;
+
+    int amax = 0;
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        const int a = qs[i] < 0 ? -(int)qs[i] : (int)qs[i];
+        if (a > amax) amax = a;
+    }
+    /* q8_K carries a SIGNED d: the quantizer uses iscale = -127/max over
+     * the signed extreme, so d is negative whenever the largest-magnitude
+     * value is positive. Scale off |d| and let the sign ride through inv
+     * below. Feeding the signed product to e4m3_encode returned 0 for
+     * about half of all blocks, zeroing them outright, which is what made
+     * W4A4 output degenerate. */
+    const float d = blk->d;
+    const uint8_t e = e4m3_encode(fabsf(d) * (float)amax * (1.0f / 6.0f));
+    const uint32_t kb = (sub >> 2) & 3u, sq = sub & 3u;
+    uint8_t *base = out
+            + ((uint64_t)(t >> 3) * in_blocks + sb) * PULSAR_NVFP4_ACT_TILE
+            + (uint64_t)kb * PULSAR_NVFP4_ACT_BLK;
+    const uint32_t r = t & 7u;
+    base[256u + r * 4u + sq] = e;
+
+    const float dec = ue4m3_half(e) * 2.0f;
+    const float inv = dec > 0.0f ? d / dec : 0.0f;   /* signed on purpose */
+    uint8_t *q = base + r * 32u + sq * 8u;
+    #pragma unroll
+    for (int i = 0; i < 8; i++)
+        q[i] = (uint8_t)(e2m1_encode((float)qs[i] * inv)
+                         | (e2m1_encode((float)qs[i + 8] * inv) << 4));
+}
+
+/* per-device, grow-on-demand activation scratch (same shape as the gqa
+ * split scratch): the converted tile is transient and sized by n_tok */
+static void *g_nvfp4_act[16];
+static uint64_t g_nvfp4_act_cap[16];
+
+static void *nvfp4_act_scratch(uint64_t bytes) {
+    int dev = 0;
+    (void)cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 16) return NULL;
+    if (bytes <= g_nvfp4_act_cap[dev]) return g_nvfp4_act[dev];
+    /* cudaMalloc is illegal mid graph-capture and pulsar captures the
+     * forward, so grow only when free to do so and take a generous floor
+     * to make that happen exactly once. A call that finds the buffer
+     * short while capturing returns NULL and rides the int8 path. */
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(cudaStreamPerThread, &cap) != cudaSuccess ||
+        cap != cudaStreamCaptureStatusNone) {
+        return NULL;
+    }
+    const uint64_t floor_bytes = 64u << 20;
+    if (bytes < floor_bytes) bytes = floor_bytes;
+    if (g_nvfp4_act[dev]) (void)cudaFree(g_nvfp4_act[dev]);
+    g_nvfp4_act[dev] = NULL;
+    g_nvfp4_act_cap[dev] = 0;
+    if (!cuda_ok(cudaMalloc(&g_nvfp4_act[dev], bytes), "nvfp4 act scratch")) return NULL;
+    g_nvfp4_act_cap[dev] = bytes;
+    return g_nvfp4_act[dev];
+}
+
+/* W4A4 is per CALL SITE, not global. The calibrated NVFP4 checkpoint
+ * this recipe comes from (qwen38-ara, compressed-tensors
+ * nvfp4-pack-quantized) excludes lm_head, the whole MTP block and EVERY
+ * linear_attn layer from quantization, leaving only the FFN and the
+ * full-attention projections in fp4. Gated DeltaNet carries a recurrent
+ * state across the sequence, so activation noise there accumulates
+ * instead of averaging out - which is exactly what a blanket
+ * PULSAR_FP4=1 did to our output. The caller ORs PULSAR_QUANT_A4_OK
+ * into  on the sites the recipe allows. */
+static bool nvfp4_a4_on() {
+    static const bool on = getenv("PULSAR_FP4") != NULL;
+    return on;
+}
+
+/* exposed for the activation error-budget selftest */
+extern "C" int pulsar_nvfp4_from_q8k(
+        void *out_dev, const void *xq_dev, uint32_t in_dim, uint32_t n_tok) {
+    if (in_dim == 0 || n_tok == 0) return 0;
+    const uint32_t n_sub = in_dim / 16u;
+    dim3 grid((n_sub + 255u) / 256u, (n_tok + 7u) & ~7u, 1);
+    nvfp4_from_q8K_kernel<<<grid, 256>>>(
+            (uint8_t *)out_dev, (const block_q8_K *)xq_dev, in_dim, n_sub, n_tok);
+    return cuda_ok(cudaGetLastError(), "nvfp4_from_q8k launch");
+}
+
+extern "C" int pulsar_quantize_nvfp4(
+        void *out_dev, const void *x_dev, uint32_t in_dim, uint32_t n_rows) {
+    if (in_dim == 0 || n_rows == 0) return 0;
+    if (in_dim % 256u) return cuda_ok(cudaErrorInvalidValue, "nvfp4 quantize in_dim%256");
+    const uint32_t n_sub = in_dim / 16u;
+    dim3 grid((n_sub + 255u) / 256u, (n_rows + 7u) & ~7u, 1);
+    nvfp4_quantize_kernel<<<grid, 256>>>(
+            (uint8_t *)out_dev, (const float *)x_dev, in_dim, n_sub, n_rows);
+    return cuda_ok(cudaGetLastError(), "nvfp4 quantize launch");
+}
+
+extern "C" int pulsar_matmul_nvfp4_a4(
+        void *out_dev, const void *w_dev, const void *xq_dev,
+        uint32_t in_dim, uint32_t out_dim, uint32_t n_tok, uint64_t row_bytes) {
+    if (out_dim == 0 || n_tok == 0) return 0;
+    if (in_dim % 256u) return cuda_ok(cudaErrorInvalidValue, "nvfp4 a4 in_dim%256");
+    if (pulsar_device_cc_major() < 12)
+        return cuda_ok(cudaErrorNotSupported, "nvfp4 a4 needs sm_120a");
+    dim3 grid((out_dim + 31u) / 32u, (n_tok + 127u) / 128u, 1);
+    matmul_nvfp4_a4_kernel<<<grid, 256>>>(
+            (float *)out_dev, (const char *)w_dev, (const char *)xq_dev,
+            in_dim / 256u, out_dim, n_tok, row_bytes);
+    return cuda_ok(cudaGetLastError(), "matmul_nvfp4_a4 launch");
+}
+
+
+/* Builds (or reuses) the octet-major activation tile for this call.
+ * Returns NULL when the scratch cannot be grown right now, which just
+ * means the GEMM reads q8_K rows the old way. */
+static const char *gemm_octet_tile(const void *xq_dev, uint32_t in_blocks, uint32_t n_tok) {
+    if (getenv("PULSAR_NO_OCT")) return NULL;
+    const uint32_t n_oct = (n_tok + 7u) >> 3;
+    void *tile = oct_scratch((uint64_t)n_oct * in_blocks * PULSAR_OCT_TILE);
+    if (!tile) return NULL;
+    dim3 cg(in_blocks, n_oct, 1);
+    q8K_to_octet_kernel<<<cg, 256>>>(
+            (char *)tile, (const block_q8_K *)xq_dev, in_blocks, n_tok);
+    return (const char *)tile;
+}
+
+
+/* Streaming-read bandwidth probe. A D2D cudaMemcpy cannot measure this:
+ * it is bounded by the copy engine (~390 GB/s on every card in this box)
+ * and a small buffer additionally lands in L2, which runs to 32MB on Ada.
+ * Decode reads weights through the SMs, so probe that path instead. */
+__global__ static void bw_read_kernel(const float4 *p, uint64_t n4, float *out) {
+    uint64_t stride = (uint64_t)gridDim.x * blockDim.x;
+    float acc = 0.0f;
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += stride) {
+        float4 v = p[i];
+        acc += v.x + v.y + v.z + v.w;
+    }
+    /* never true: keeps the loads from being optimized away */
+    if (acc == 1.2345678e30f) out[0] = acc;
+}
+
+extern "C" int pulsar_bw_read(void *buf, uint64_t bytes, void *sink) {
+    bw_read_kernel<<<1024, 256>>>((const float4 *)buf, bytes / 16u, (float *)sink);
+    return cuda_ok(cudaGetLastError(), "bw_read launch");
+}
+
 extern "C" int pulsar_matmul_kq(
         void *out_dev,
         const void *w_dev,
@@ -4034,24 +4763,73 @@ extern "C" int pulsar_matmul_kq(
     if (in_dim == 0 || in_dim % PULSAR_QK_K != 0 || out_dim == 0 || n_tok == 0 || row_bytes == 0) {
         return 0;
     }
+    const bool a4_ok = (quant & PULSAR_QUANT_A4_OK) != 0u;
+    quant &= ~PULSAR_QUANT_A4_OK;
     const uint32_t in_blocks = in_dim / PULSAR_QK_K;
     dim3 block(32, 4, 1);
     /* wide prefill batches on q4_K take the shared-memory GEMM: one
      * weight read per 64 tokens instead of per 16. PULSAR_NO_GEMM=1
      * falls back to the grouped path (uncached read: it is one launch). */
     if (n_tok >= 32u &&
-        (quant == PULSAR_QUANT_Q4_K || quant == PULSAR_QUANT_Q6_K) &&
+        (quant == PULSAR_QUANT_Q4_K || quant == PULSAR_QUANT_Q6_K
+         || quant == PULSAR_QUANT_NVFP4) &&
         !getenv("PULSAR_NO_GEMM")) {
+        /* Blackwell native FP4: weights ride into the tensor core with
+         * no dequant at all and the mma covers k=64 per instruction
+         * instead of 16. Measured 2.79x on the GEMM in isolation.
+         * Opt-in via PULSAR_FP4 because it puts activations in fp4 too
+         * (W4A4), which changes numerics by construction. */
+        if (quant == PULSAR_QUANT_NVFP4 && a4_ok && pulsar_device_cc_major() >= 12
+            && nvfp4_a4_on()) {
+            const uint32_t rows = (n_tok + 7u) & ~7u;
+            const uint64_t abytes = (uint64_t)rows * in_blocks * PULSAR_NVFP4_SB_BYTES;
+            void *act = nvfp4_act_scratch(abytes);
+            if (act) { /* alloc failure falls through to the int8 path */
+                const uint32_t n_sub = in_dim / 16u;
+                dim3 cg((n_sub + 255u) / 256u, rows, 1);
+                nvfp4_from_q8K_kernel<<<cg, 256>>>(
+                        (uint8_t *)act, (const block_q8_K *)xq_dev, in_dim, n_sub, n_tok);
+                dim3 fg((out_dim + 31u) / 32u, (n_tok + 127u) / 128u, 1);
+                matmul_nvfp4_a4_kernel<<<fg, 256>>>(
+                        (float *)out_dev, (const char *)w_dev, (const char *)act,
+                        in_blocks, out_dim, n_tok, row_bytes);
+                return cuda_ok(cudaGetLastError(), "matmul_nvfp4_a4 dispatch");
+            }
+        }
+        if (quant == PULSAR_QUANT_NVFP4 && pulsar_device_cc_major() >= 8
+            && !getenv("PULSAR_NO_MMA")) {
+            const char *yoct = gemm_octet_tile(xq_dev, in_blocks, n_tok);
+            dim3 mgrid((out_dim + 31u) / 32u, (n_tok + 63u) / 64u, 1);
+            if (yoct) {
+                matmul_kq_gemm_mma_kernel<unpack_nvfp4, true><<<mgrid, 256>>>(
+                        (float *)out_dev, (const char *)w_dev,
+                        (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes, yoct);
+            } else {
+                matmul_kq_gemm_mma_kernel<unpack_nvfp4, false><<<mgrid, 256>>>(
+                        (float *)out_dev, (const char *)w_dev,
+                        (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes, NULL);
+            }
+            return cuda_ok(cudaGetLastError(), "matmul_kq_gemm_mma nvfp4 launch");
+        }
+        if (quant == PULSAR_QUANT_NVFP4) {
+            dim3 ggrid((out_dim + PULSAR_GEMM_BM - 1u) / PULSAR_GEMM_BM,
+                       (n_tok + PULSAR_GEMM_BN - 1u) / PULSAR_GEMM_BN, 1);
+            dim3 gblock(64, 4, 1);
+            matmul_kq_gemm_nvfp4<<<ggrid, gblock>>>(
+                    (float *)out_dev, (const char *)w_dev,
+                    (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes);
+            return cuda_ok(cudaGetLastError(), "matmul_kq_gemm_nvfp4 launch");
+        }
         if (pulsar_device_cc_major() >= 8 && !getenv("PULSAR_NO_MMA")) {
             dim3 mgrid((out_dim + 31u) / 32u, (n_tok + 63u) / 64u, 1);
             if (quant == PULSAR_QUANT_Q4_K)
-                matmul_kq_gemm_mma_kernel<unpack_q4_K><<<mgrid, 256>>>(
+                matmul_kq_gemm_mma_kernel<unpack_q4_K, false><<<mgrid, 256>>>(
                         (float *)out_dev, (const char *)w_dev,
-                        (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes);
+                        (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes, NULL);
             else
-                matmul_kq_gemm_mma_kernel<unpack_q6_K><<<mgrid, 256>>>(
+                matmul_kq_gemm_mma_kernel<unpack_q6_K, false><<<mgrid, 256>>>(
                         (float *)out_dev, (const char *)w_dev,
-                        (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes);
+                        (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes, NULL);
             return cuda_ok(cudaGetLastError(), "matmul_kq_gemm_mma launch");
         }
         dim3 ggrid((out_dim + PULSAR_GEMM_BM - 1u) / PULSAR_GEMM_BM,
@@ -4088,7 +4866,8 @@ extern "C" int pulsar_matmul_kq(
                     (float *)out_dev + (uint64_t)base * out_dim,
                     w_dev,
                     (const block_q8_K *)xq_dev + (uint64_t)base * in_blocks_g,
-                    in_dim, out_dim, cnt, row_bytes, quant)) {
+                    in_dim, out_dim, cnt, row_bytes,
+                    quant | (a4_ok ? PULSAR_QUANT_A4_OK : 0u))) {
                 return 0;
             }
         }
@@ -4126,6 +4905,41 @@ extern "C" int pulsar_matmul_kq(
         case PULSAR_QUANT_Q5_K: PULSAR_KQW_T(wdot_q5_K);
         case PULSAR_QUANT_Q6_K: PULSAR_KQW_T(wdot_q6_K);
 case PULSAR_QUANT_IQ4_XS: PULSAR_KQW_T(wdot_iq4_xs);
+        /* NVFP4 was missing here, so every multi-token pass on an NVFP4
+         * gguf fell to matmul_kqw_kernel = one FULL weight sweep per
+         * token. nsys on an MTP run: 90% of GPU time in
+         * matmul_kqw_kernel<wdot_nvfp4>. That made a 2-token
+         * speculative verify cost ~2 forwards, which is why MTP could
+         * not profit even at 88% draft acceptance. */
+        case PULSAR_QUANT_NVFP4: {
+            /* NVFP4 is the decode hot path (63% of GPU time on an MTP
+             * run), so it takes the row-tiled kernel: R rows per warp
+             * amortize the staged activation loads that the profiler
+             * showed this kernel starving on. PULSAR_ROWTILE=<1|2|4>
+             * overrides; 1 restores the one-row-per-warp kernel. */
+            /* R=2 measured best: 53.2 tok/s vs 50.4 at R=1 and 50.8 at
+             * R=4, where the acc[R][TT] register file starts costing
+             * more occupancy than the reuse buys back. */
+            uint32_t rt = 2u;
+            if (const char *e = getenv("PULSAR_ROWTILE")) {
+                const uint32_t v = (uint32_t)atoi(e);
+                if (v == 1u || v == 2u || v == 4u) rt = v;
+            }
+            if (rt > 1u && n_tok <= 4u) {
+                const uint32_t per = 4u * rt; /* 4 row-warps per block */
+                dim3 rgrid((out_dim + per - 1u) / per, 1, 1);
+                if (rt == 2u)
+                    matmul_kqw_rows_kernel<wdot_nvfp4, 4, 2><<<rgrid, block>>>(
+                            (float *)out_dev, (const char *)w_dev,
+                            (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes);
+                else
+                    matmul_kqw_rows_kernel<wdot_nvfp4, 4, 4><<<rgrid, block>>>(
+                            (float *)out_dev, (const char *)w_dev,
+                            (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes);
+                return cuda_ok(cudaGetLastError(), "matmul_kqw_rows launch");
+            }
+            PULSAR_KQW_T(wdot_nvfp4);
+        }
         default: break;
         }
         #undef PULSAR_KQW_T

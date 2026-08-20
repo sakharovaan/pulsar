@@ -1351,6 +1351,7 @@
 
   <div class="stat-grid">
     <div class="stat"><div class="stat-v" id="stat-tps">—</div><div class="stat-k">tok/s</div></div>
+    <div class="stat"><div class="stat-v" id="stat-prefill">—</div><div class="stat-k">prefill</div></div>
     <div class="stat"><div class="stat-v" id="stat-ctx">—</div><div class="stat-k">context</div></div>
     <div class="stat"><div class="stat-v" id="stat-turns">0</div><div class="stat-k">turns</div></div>
   </div>
@@ -1483,6 +1484,11 @@
                 <option value="q4_0">q4_0</option>
                 <option value="turbo4">turbo4</option>
                 <option value="turbo8">turbo8</option>
+                <option value="turbo2">turbo2 (dsv4)</option>
+                <option value="turbo3">turbo3 (dsv4)</option>
+                <option value="turbo1_tcq">turbo1_tcq (dsv4)</option>
+                <option value="turbo2_tcq">turbo2_tcq (dsv4)</option>
+                <option value="turbo3_tcq">turbo3_tcq (dsv4)</option>
               </select>
               <button id="kv-apply" class="cpu-toggle" type="button" title="Re-exec the server at this KV format (clears the chat)" disabled>Apply</button>
             </div>
@@ -1609,6 +1615,7 @@ function setChips(slot) {
   $("chip-ctx").textContent = curCtx ? fmtCtx(curCtx) + "/" + fmtCtx(maxCtx) : "—";
   $("chip-slot").textContent = slot;
   $("stat-tps").textContent = lastTps ? lastTps.toFixed(1) : "—";
+  $("stat-prefill").textContent = lastPrefillTps ? Math.round(lastPrefillTps) + "/s" : "—";
   $("stat-ctx").textContent = curCtx ? fmtCtx(curCtx) + "/" + fmtCtx(maxCtx) : fmtCtx(maxCtx);
   $("stat-turns").textContent = String(turns);
   $("stat-active").textContent = controller ? "1" : "0";

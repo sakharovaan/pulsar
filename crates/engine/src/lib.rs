@@ -33,7 +33,7 @@ mod real {
 
     mod dsv4;
     mod k3;
-    mod qwen35;
+    pub(crate) mod qwen35;
     pub use dsv4::generate_dspark;
     pub use qwen35::{generate_dflash, DraftModel};
 
@@ -974,7 +974,11 @@ mod real {
     /// t, embedding of t+1) through one extra transformer layer.
     struct MtpLayer {
         layer: LayerW,
-        eh_proj: DeviceBuf, // q8_0 [n_embd][2*n_embd]
+        /// [n_embd][2*n_embd] in whatever the file ships. NVFP4 ggufs
+        /// (Qwen3.8 nextn, ggml type 40) kept this native, and reading
+        /// those 36-byte blocks as q8_0's 34-byte ones made EVERY draft
+        /// logit NaN -> argmax 0 -> 0% acceptance and a 3x slowdown.
+        eh_proj: MatW,
         enorm: DeviceBuf,
         hnorm: DeviceBuf,
         head_norm: DeviceBuf,
@@ -1053,6 +1057,7 @@ mod real {
         /// FFN tensor-parallel shards on the second card (PULSAR_TP=1,
         /// dense qwen35); None everywhere else
         pub(crate) tp: Option<TpW>,
+        pub(crate) tp_c: Option<TpCW>,
     }
 
     /// deepseek4 output_hc_*: collapse the final HC streams before
@@ -2594,6 +2599,20 @@ mod real {
         Ok(DeviceBuf::from_bytes(&read_tensor_bytes(file, g, name)?)?)
     }
 
+    /// Raw f16 tensor bytes -> device, no dequant (DFlash2 selector
+    /// codebooks: gather tables read as __half by the kernel, kept f16
+    /// to halve their 254MB VRAM cost). Bypasses read_tensor_bytes on
+    /// purpose - its F16-2D branch requantizes to q8_0.
+    fn upload_raw_f16(file: &VFile, g: &Gguf, name: &str) -> Result<DeviceBuf> {
+        let t = g.tensor(name).ok_or_else(|| meta_err(name))?;
+        if t.ty != TensorType::F16 {
+            return Err(format!("{name}: expected f16, got {:?}", t.ty).into());
+        }
+        let mut buf = vec![0u8; t.n_elements() as usize * 2];
+        file.read_exact_at(&mut buf, g.data_offset + t.offset)?;
+        Ok(DeviceBuf::from_bytes(&buf)?)
+    }
+
     /// FFN tensor-parallel shards (PULSAR_TP=1, dense qwen35): card B's
     /// halves. gate/up hold output rows [half..n_ff), down holds input
     /// blocks [half..) of every row repacked contiguously. Card A's
@@ -2611,6 +2630,17 @@ mod real {
         gdn: Option<Qwen35Gdn>,
         attn: Option<Qwen35Attn>,
     }
+    /// Third-card FFN peer (PULSAR_TP with 3+ devices). The GDN and
+    /// attention halves stay on the A/B pair: only the FFN is split
+    /// three ways, because it is the largest single weight block per
+    /// layer and one code path, so the extra card's bandwidth joins the
+    /// decode weight read without a third GDN state or KV shard.
+    pub(crate) struct TpCW {
+        pub(crate) dev: i32,
+        pub(crate) width: u32,
+        ffn: Vec<Option<TpFfnW>>,
+    }
+
     pub(crate) struct TpW {
         pub(crate) dev: i32,
         /// per-card ffn width = n_ff_exp / 2
@@ -2678,6 +2708,40 @@ mod real {
         for r in 0..n {
             let row = &bytes[r * rb..(r + 1) * rb];
             sl.extend_from_slice(if second { &row[hb..] } else { &row[..hb] });
+        }
+        if native {
+            Ok(MatW::Kq(KqW { w: DeviceBuf::from_bytes(&sl)?, row_bytes: hb as u64, quant }))
+        } else {
+            Ok(MatW::Q8(DeviceBuf::from_bytes(&sl)?))
+        }
+    }
+
+    /// MatW with an arbitrary set of INPUT column ranges repacked
+    /// contiguously per output row (GDN TP: the v heads a card owns are
+    /// interleaved, not a contiguous half). Ranges are in input values,
+    /// quant-block aligned by construction (multiples of ssm_state).
+    fn matw_col_ranges(file: &VFile, g: &Gguf, name: &str, cols: &[(u64, u64)]) -> Result<MatW> {
+        let t = g.tensor(name).ok_or_else(|| meta_err(name))?;
+        let in_dim = t.dims[0] as u64;
+        let native = MatW::keep_native(t);
+        let (bytes, rb, quant) = if native {
+            read_kq_bytes(file, g, name)?
+        } else {
+            let b = read_tensor_bytes(file, g, name)?;
+            (b, in_dim / 32 * 34, 0)
+        };
+        let rb = rb as usize;
+        // value index -> byte offset inside a row; exact for block-aligned
+        // ranges (256-value superblocks for K-quants, 32 for q8_0)
+        let bo = |v: u64| -> usize { (v as u128 * rb as u128 / in_dim as u128) as usize };
+        let hb: usize = cols.iter().map(|&(a, b)| bo(b) - bo(a)).sum();
+        let n = bytes.len() / rb;
+        let mut sl = Vec::with_capacity(n * hb);
+        for r in 0..n {
+            let row = &bytes[r * rb..(r + 1) * rb];
+            for &(a, b) in cols {
+                sl.extend_from_slice(&row[bo(a)..bo(b)]);
+            }
         }
         if native {
             Ok(MatW::Kq(KqW { w: DeviceBuf::from_bytes(&sl)?, row_bytes: hb as u64, quant }))
@@ -2934,10 +2998,34 @@ mod real {
         pub(crate) fn tp_attn(&self, il: usize) -> Option<&Qwen35Attn> {
             self.tp.as_ref()?.layers.get(il)?.as_ref()?.attn.as_ref()
         }
+        /// Third-card FFN shard for exec layer `il` (PULSAR_TP, 3+ cards).
+        pub(crate) fn tp_ffn3(&self, il: usize) -> Option<&TpFfnW> {
+            self.tp_c.as_ref()?.ffn.get(il)?.as_ref()
+        }
         pub fn load(path: &Path) -> Result<Model> {
             let (shards, gguf) = parse_header(path)?;
             let file = VFile::open(&shards)?;
             let shape = Shape::from_gguf(&gguf)?;
+
+            // A model bigger than every card combined (or a single-card
+            // run, where the dense-split planner never engages) must
+            // degrade to pinned host RAM, not die at cudaMalloc: budget
+            // each card's free VRAM minus a 3GiB reserve for
+            // KV/activations/preq scratch/graph pools (state allocs come
+            // AFTER weights and cannot pin). Spent only by weight
+            // uploads; multi-GPU plans that already fit never touch the
+            // ceiling, so placement there is unchanged.
+            // Establish the measured primary FIRST: mem_info saves and
+            // restores the current device, and before the first ensure
+            // that is CUDA's default (0) - budgeting here would silently
+            // re-pin every later allocation to device 0 even when the
+            // probe picked a different primary.
+            kernels::set_device(kernels::primary_device())?;
+            for d in 0..kernels::device_count() {
+                if let Ok((free, _)) = kernels::mem_info(d) {
+                    kernels::set_weight_vram_budget(d, free as i64 - (3i64 << 30));
+                }
+            }
 
             // the embedding table is read ~one row per token - pinned
             // host is free for it and returns ~1GB of VRAM to hot weights
@@ -2945,13 +3033,15 @@ mod real {
                 // deepseek4 embd arrives F16 (antirez ds4 recipe) or Q5_K
                 // (unsloth UD-*); both convert to q8_0 for embed_q8_0.
                 let bytes = read_tensor_bytes(&file, &gguf, "token_embd.weight")?;
-                let mut buf = if matches!(shape.family, Family::Mla | Family::Dsv4) {
-                    DeviceBuf::alloc_pinned(bytes.len())?
+                if matches!(shape.family, Family::Mla | Family::Dsv4) {
+                    let mut buf = DeviceBuf::alloc_pinned(bytes.len())?;
+                    buf.write(0, &bytes)?;
+                    buf
                 } else {
-                    DeviceBuf::alloc(bytes.len())?
-                };
-                buf.write(0, &bytes)?;
-                buf
+                    // budgeted weight path: VRAM while it lasts, pinned on
+                    // overflow (a row-per-token read - pinned costs nothing)
+                    DeviceBuf::from_bytes(&bytes)?
+                }
             };
             let output_norm = upload(&file, &gguf, "output_norm.weight")?;
             // K3 mixes the banked AttnRes checkpoints one last time before
@@ -3164,6 +3254,7 @@ mod real {
             // this is most of TP's win at none of the KV/GDN sharding
             // cost; attention stays whole on the primary, and the dense
             // split is skipped (all layers owned by the primary).
+            let mut tp3_cfg: Option<(i32, u32, u32)> = None;
             let tp_cfg: Option<(i32, u32)> = if qwen35_dense
                 && kernels::device_count() > 1
                 && std::env::var("PULSAR_TP").ok().as_deref() == Some("1")
@@ -3186,18 +3277,172 @@ mod real {
                             .unwrap_or(std::cmp::Ordering::Equal)
                     })
                     .unwrap();
-                eprintln!(
-                    "pulsar: FFN tensor parallel on devices {primary}+{dev_b} ({}-wide halves)",
-                    shape.n_ff_exp / 2
-                );
-                Some((dev_b, shape.n_ff_exp / 2))
+                // Split the FFN by MEASURED VRAM BANDWIDTH, not evenly.
+                // Every sublayer is a barrier: both cards read their
+                // shard's weights and the layer advances when the SLOWER
+                // one finishes, so an even split on uneven cards runs the
+                // whole model at the slow card's rate. Measured here with
+                // nsys: the 4060 Ti moved 275 GB/s of its 288 GB/s peak
+                // while the 5060 Ti idled at 61% of its own.
+                //
+                // A's share must stay a multiple of PULSAR_QK_K: ffn_down
+                // splits along the CONTRACTION dim, so the cut has to land
+                // on a quant block boundary. Clamped to [1/4, 3/4] so a
+                // bogus bandwidth probe cannot starve a card.
+                let qk = 256u32;
+                let (ba, bb) = (kernels::vram_bandwidth(primary), kernels::vram_bandwidth(dev_b));
+                let frac = if ba > 0.0 && bb > 0.0 { ba / (ba + bb) } else { 0.5 };
+                let n_ff = shape.n_ff_exp;
+                // round to the NEAREST block: truncating hands the
+                // other card a whole extra block, which on a pair of
+                // identical cards is pure straggler time (measured 47.8
+                // -> 46.2 tok/s from one block of skew)
+                let half = ((n_ff as f64 * frac / qk as f64).round() as u32 * qk)
+                    .clamp(n_ff / 4 / qk * qk, n_ff * 3 / 4 / qk * qk);
+                // Third card joins the FFN split when one exists and is
+                // not being used for a PP tail. Shares stay proportional
+                // to read bandwidth across all three.
+                let third_ffn: Option<(i32, u32, u32)> = if std::env::var("PULSAR_TP3").ok().as_deref() == Some("off") {
+                    None
+                } else {
+                    (0..kernels::device_count())
+                        .filter(|&d| d != primary && d != dev_b)
+                        .max_by(|&a, &b| {
+                            kernels::vram_bandwidth(a)
+                                .partial_cmp(&kernels::vram_bandwidth(b))
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                        .and_then(|d3| {
+                            let b3 = kernels::vram_bandwidth(d3);
+                            if b3 <= 0.0 || ba <= 0.0 || bb <= 0.0 {
+                                return None;
+                            }
+                            let tot = ba + bb + b3;
+                            let blocks = n_ff / qk;
+                            let wa = ((blocks as f64 * ba / tot).round() as u32).max(1);
+                            let wb = ((blocks as f64 * bb / tot).round() as u32).max(1);
+                            if wa + wb >= blocks {
+                                return None;
+                            }
+                            Some((d3, wa * qk, wb * qk))
+                        })
+                };
+                if let Some((d3, wa, wb)) = third_ffn {
+                    eprintln!(
+                        "pulsar: FFN tensor parallel on devices {primary}+{dev_b}+{d3} ({wa}/{wb}/{} split, {:.0}/{:.0}/{:.0} GB/s)",
+                        n_ff - wa - wb, ba, bb, kernels::vram_bandwidth(d3)
+                    );
+                } else {
+                    eprintln!(
+                        "pulsar: FFN tensor parallel on devices {primary}+{dev_b} ({half}/{} split, {:.0}/{:.0} GB/s)",
+                        n_ff - half, ba, bb
+                    );
+                }
+                tp3_cfg = third_ffn;
+                Some((dev_b, third_ffn.map_or(half, |(_, wa, _)| wa)))
             } else {
                 None
             };
             let tp_ffn_stash: std::cell::RefCell<Option<TpFfnW>> = std::cell::RefCell::new(None);
+            let tp_ffn3_stash: std::cell::RefCell<Option<TpFfnW>> = std::cell::RefCell::new(None);
+            let mut tp3_layers: Vec<Option<TpFfnW>> = Vec::new();
             let tp_gdn_stash: std::cell::RefCell<Option<Qwen35Gdn>> = std::cell::RefCell::new(None);
             let tp_attn_stash: std::cell::RefCell<Option<Qwen35Attn>> = std::cell::RefCell::new(None);
             let mut layer_dev = vec![primary; shape.n_exec_layer as usize];
+            // TP + PP: TP splits each layer across the fast pair, so the
+            // dense split used to be mutually exclusive with it and any
+            // third card sat idle. A third device can still take a TAIL
+            // of whole layers as a pipeline stage - those layers get no
+            // TP weights (tp_attn/tp_gdn/tp_ffn are per-layer Options and
+            // return None), run the plain path on their owner, and their
+            // KV allocates there too via the dense_split branch in
+            // State::new. That is the only way a third card of a
+            // different class buys context: KV must live where its
+            // attention runs, so whole layers move, not caches.
+            // PULSAR_PP=<n> sets the tail length, =off disables.
+            if let Some((dev_b, _)) = tp_cfg {
+                let pp = std::env::var("PULSAR_PP").ok();
+                if pp.as_deref() != Some("off") {
+                    if let Some(third) = (0..kernels::device_count())
+                        .filter(|&d| d != primary && d != dev_b)
+                        .max_by(|&a, &b| {
+                            kernels::vram_bandwidth(a)
+                                .partial_cmp(&kernels::vram_bandwidth(b))
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                    {
+                        // Per-layer bytes are ~uniform on this family, so
+                        // size the tail from the third card's free VRAM
+                        // rather than a fixed fraction: heterogeneous rigs
+                        // are the point. Reserve covers its KV share plus
+                        // prefill scratch.
+                        let n_layers = shape.n_exec_layer as usize;
+                        let mut n_tail = pp
+                            .as_deref()
+                            .and_then(|v| v.parse::<usize>().ok())
+                            .unwrap_or(0);
+                        // A tail costs decode: its layers read their
+                        // weights from ONE card while the TP layers read
+                        // theirs from two in parallel, and layers are
+                        // sequential within a token. Measured on the 27B
+                        // NVFP4 (2x 5060 Ti + 4060 Ti): 36.5 tok/s with a
+                        // 32-layer tail vs 47.8 without, same prefill and
+                        // same 196608 max ctx, because the KV auto-sizer
+                        // absorbs the smaller budget by quantizing. So
+                        // only spill to the third card when the TP pair
+                        // genuinely cannot hold the weights; PULSAR_PP=<n>
+                        // still forces a tail when capacity beats speed.
+                        let fits_on_pair = {
+                            let total: u64 = gguf
+                                .tensors
+                                .iter()
+                                .filter_map(|t| t.byte_size())
+                                .sum();
+                            // TP halves the per-layer matrices, so each of
+                            // the pair holds ~half; leave room for KV and
+                            // the prefill hop/scratch buffers
+                            let need = total / 2 + (4u64 << 30);
+                            [primary, dev_b].iter().all(|&d| {
+                                kernels::mem_info(d).map_or(false, |(free, _)| free as u64 >= need)
+                            })
+                        };
+                        if n_tail == 0 && fits_on_pair {
+                            eprintln!(
+                                "pulsar: no pipeline tail: weights fit the TP pair, keeping every layer 2-way (PULSAR_PP=<n> to spill onto device {third} for more KV room)"
+                            );
+                        } else if n_tail == 0 {
+                            // layer 0's own tensors ARE the per-layer cost
+                            // on this family (uniform blocks); no averaging
+                            // over a total that also carries embd/head
+                            let per: u64 = gguf
+                                .tensors
+                                .iter()
+                                .filter(|t| t.name.starts_with("blk.0."))
+                                .filter_map(|t| t.byte_size())
+                                .sum();
+                            if let (Ok((free, _)), true) = (kernels::mem_info(third), per > 0) {
+                                let reserve = 3u64 << 30;
+                                let usable = (free as u64).saturating_sub(reserve);
+                                n_tail = (usable / per) as usize;
+                            }
+                        }
+                        // keep TP meaningful: never hand over more than
+                        // half the stack
+                        n_tail = n_tail.min(n_layers / 2);
+                        if n_tail > 0 {
+                            for d in layer_dev.iter_mut().skip(n_layers - n_tail) {
+                                *d = third;
+                            }
+                            eprintln!(
+                                "pulsar: pipeline tail: layers {}..{} on device {third} (TP {primary}+{dev_b} for 0..{})",
+                                n_layers - n_tail,
+                                n_layers,
+                                n_layers - n_tail
+                            );
+                        }
+                    }
+                }
+            }
             if qwen35_dense
                 && tp_cfg.is_none()
                 && kernels::device_count() > 1
@@ -3263,18 +3508,83 @@ mod real {
                         n0 -= 1;
                     }
                 }
-                if let Some(n) = std::env::var("PULSAR_SPLIT").ok().and_then(|v| v.parse::<usize>().ok()) {
+                // PULSAR_SPLIT=<n> pins the primary's layer count;
+                // PULSAR_SPLIT=<n0>,<n1>,... pins EVERY card's count
+                // (primary first, then secondaries fastest-first). The
+                // list form exists because the auto plan sizes by WEIGHT
+                // bytes only - it cannot see ctx, which is a State
+                // parameter chosen after load - so it packs the fewest
+                // cards and then KV OOMs at long ctx. Spreading layers
+                // wider spreads their KV with them.
+                let split_env = std::env::var("PULSAR_SPLIT").ok();
+                let split_list: Vec<usize> = split_env
+                    .as_deref()
+                    .map(|v| v.split(',').filter_map(|x| x.trim().parse::<usize>().ok()).collect())
+                    .unwrap_or_default();
+                if let Some(&n) = split_list.first() {
                     n0 = n.min(lbytes.len());
                 }
-                for d in layer_dev.iter_mut().skip(n0) {
-                    *d = second;
+                // Spread the remainder over EVERY secondary, fastest
+                // first, each filled to its own free VRAM. Two-card was
+                // the old shape and it stranded a third card entirely;
+                // rigs running pulsar are heterogeneous, and a slow card
+                // still contributes capacity (its layers' KV allocates
+                // there too, which is what raises the context ceiling).
+                // Layers run sequentially within a token, so filling the
+                // fast cards first minimizes sum(bytes/bw), same
+                // reasoning as the primary fill above.
+                let mut secs: Vec<i32> = (0..kernels::device_count())
+                    .filter(|&d| d != primary)
+                    .collect();
+                secs.sort_by(|&a, &b| {
+                    kernels::vram_bandwidth(b)
+                        .partial_cmp(&kernels::vram_bandwidth(a))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let mut i = n0;
+                let n_sec = secs.len();
+                for (si, d) in secs.iter().copied().enumerate() {
+                    if i >= lbytes.len() {
+                        break;
+                    }
+                    let free = kernels::mem_info(d).map(|(f, _)| f as u64).unwrap_or(0);
+                    let reserve = 2u64 << 30;
+                    let mut take = 0usize;
+                    let mut used = 0u64;
+                    while i + take < lbytes.len()
+                        && used + lbytes[i + take] + reserve <= free
+                    {
+                        used += lbytes[i + take];
+                        take += 1;
+                    }
+                    if let Some(&n) = split_list.get(si + 1) {
+                        take = n.min(lbytes.len() - i);
+                    } else if si + 1 == n_sec {
+                        // last card swallows any remainder: leaving layers
+                        // unassigned would silently keep them on an already
+                        // full primary and die at cudaMalloc instead
+                        take = lbytes.len() - i;
+                    }
+                    for k in 0..take {
+                        layer_dev[i + k] = d;
+                    }
+                    if take > 0 {
+                        let b: u64 = lbytes[i..i + take].iter().sum();
+                        eprintln!(
+                            "pulsar: dense split: layers {}..{} on device {d} ({:.1}GiB)",
+                            i,
+                            i + take,
+                            b as f64 / GIB
+                        );
+                    }
+                    i += take;
                 }
-                let b1: u64 = lbytes[n0..].iter().sum();
+                let b0: u64 = lbytes[..n0].iter().sum();
                 eprintln!(
-                    "pulsar: dense split: layers 0..{n0} on device {primary}, {n0}..{} on device {second} ({:.1}GiB)",
-                    lbytes.len(),
-                    b1 as f64 / GIB
+                    "pulsar: dense split: layers 0..{n0} on device {primary} ({:.1}GiB)",
+                    b0 as f64 / GIB
                 );
+                let _ = second;
             }
 
             // Mla: spend a VRAM budget on the two big per-layer attn
@@ -3534,6 +3844,29 @@ mod real {
                 } else if shape.family == Family::Qwen35
                     && gguf.tensor(&t("ffn_gate_exps.weight")).is_none()
                 {
+                    // A FFN triple matmul_kq cannot dispatch (q8_0 from a
+                    // --default q8_0 quant, f16/f32 sources, or a
+                    // non-256-multiple contraction dim) rides the plain
+                    // q8_0 Dense path instead: matmul_q8_0 on the f32
+                    // activations, preq scratch prewarmed before the GDN
+                    // graph capture. ponytail: dense qwen35 + PULSAR_TP
+                    // leaves this FFN un-split on the primary (the TP
+                    // stash is K-quant only); split it when a q8_0 model
+                    // needs TP.
+                    let kq_dispatch = |ti: &TensorInfo| {
+                        MatW::keep_native(ti)
+                            || (matches!(
+                                ti.ty,
+                                TensorType::Q2K | TensorType::Q3K | TensorType::IQ2XXS
+                            ) && ti.dims[0].is_multiple_of(256))
+                    };
+                    if gguf.tensor(&t("ffn_gate.weight")).is_some_and(|ti| !kq_dispatch(ti)) {
+                        Ffn::Dense {
+                            gate: upload(&file, &gguf, &t("ffn_gate.weight"))?,
+                            up: upload(&file, &gguf, &t("ffn_up.weight"))?,
+                            down: upload(&file, &gguf, &t("ffn_down.weight"))?,
+                        }
+                    } else
                     // dense qwen35 (27B): the FFN triple resident in
                     // native K-quant on whatever device is current (the
                     // layer's owner under the dense split). Under
@@ -3542,25 +3875,37 @@ mod real {
                     // both cards read their half of every layer's FFN in
                     // parallel and the partial down outputs add. The
                     // nextn/MTP layer stays whole (il >= n_exec_layer).
-                    if let Some((dev_b, half)) = tp_cfg.filter(|_| il < shape.n_exec_layer) {
+                    if let Some((dev_b, half)) = tp_cfg.filter(|_| il < shape.n_exec_layer
+                            && layer_dev.get(il as usize).copied().unwrap_or(primary) == primary) {
                         let cur = kernels::get_device();
                         let (gb, grb, gq) = read_kq_bytes(&file, &gguf, &t("ffn_gate.weight"))?;
                         let (ub, urb, uq) = read_kq_bytes(&file, &gguf, &t("ffn_up.weight"))?;
                         let (db, drb, dq) = read_kq_bytes(&file, &gguf, &t("ffn_down.weight"))?;
                         let gsplit = half as usize * grb as usize;
                         let usplit = half as usize * urb as usize;
+                        // B's share ends where C's begins (C absent -> B
+                        // takes the remainder, the 2-card case)
+                        let wb = tp3_cfg.map(|(_, _, wb)| wb as usize);
+                        let gsplit2 = wb.map_or(gb.len(), |w| gsplit + w * grb as usize);
+                        let usplit2 = wb.map_or(ub.len(), |w| usplit + w * urb as usize);
                         // down: the contraction dim halves, so every
                         // output row contributes its first half of
                         // quant blocks to A and the rest to B
                         let drb = drb as usize;
-                        let dh = drb / 2;
+                        // same cut as gate/up, in bytes: exact because
+                        // every share is a whole number of quant blocks
+                        let n_ff_u = shape.n_ff_exp as usize;
+                        let dh = half as usize * drb / n_ff_u;
+                        let dh2 = wb.map_or(drb, |w| dh + w * drb / n_ff_u);
                         let n_out = db.len() / drb;
                         let mut da = Vec::with_capacity(n_out * dh);
-                        let mut dbb = Vec::with_capacity(n_out * dh);
+                        let mut dbb = Vec::with_capacity(n_out * (dh2 - dh));
+                        let mut dcc = Vec::with_capacity(n_out * (drb - dh2));
                         for r in 0..n_out {
                             let row = &db[r * drb..(r + 1) * drb];
                             da.extend_from_slice(&row[..dh]);
-                            dbb.extend_from_slice(&row[dh..]);
+                            dbb.extend_from_slice(&row[dh..dh2]);
+                            dcc.extend_from_slice(&row[dh2..]);
                         }
                         let kq = |bytes: &[u8], rb: u64, q: u32| -> Result<KqW> {
                             Ok(KqW { w: DeviceBuf::from_bytes(bytes)?, row_bytes: rb, quant: q })
@@ -3572,10 +3917,20 @@ mod real {
                         };
                         kernels::set_device(dev_b)?;
                         *tp_ffn_stash.borrow_mut() = Some(TpFfnW {
-                            gate: kq(&gb[gsplit..], grb, gq)?,
-                            up: kq(&ub[usplit..], urb, uq)?,
-                            down: kq(&dbb, dh as u64, dq)?,
+                            gate: kq(&gb[gsplit..gsplit2], grb, gq)?,
+                            up: kq(&ub[usplit..usplit2], urb, uq)?,
+                            // B's rows are its OWN span, which is only dh
+                            // wide when the split is even
+                            down: kq(&dbb, (dh2 - dh) as u64, dq)?,
                         });
+                        if let Some((d3, _, _)) = tp3_cfg {
+                            kernels::set_device(d3)?;
+                            *tp_ffn3_stash.borrow_mut() = Some(TpFfnW {
+                                gate: kq(&gb[gsplit2..], grb, gq)?,
+                                up: kq(&ub[usplit2..], urb, uq)?,
+                                down: kq(&dcc, (drb - dh2) as u64, dq)?,
+                            });
+                        }
                         kernels::set_device(cur)?;
                         a
                     } else {
@@ -3918,7 +4273,8 @@ mod real {
                         Attn::Qwen35(Box::new(Qwen35W {
                             attn: if !is_attn {
                                 None
-                            } else if let Some((dev_b, _)) = tp_cfg.filter(|_| il < shape.n_exec_layer) {
+                            } else if let Some((dev_b, _)) = tp_cfg.filter(|_| il < shape.n_exec_layer
+                            && layer_dev.get(il as usize).copied().unwrap_or(primary) == primary) {
                                 // TP head split: q|gate rows are per-head
                                 // [q hd | gate hd], heads outer, so head
                                 // ranges are contiguous row ranges; the
@@ -3955,7 +4311,8 @@ mod real {
                             },
                             gdn: if is_attn {
                                 None
-                            } else if let Some((dev_b, _)) = tp_cfg.filter(|_| il < shape.n_exec_layer) {
+                            } else if let Some((dev_b, _)) = tp_cfg.filter(|_| il < shape.n_exec_layer
+                            && layer_dev.get(il as usize).copied().unwrap_or(primary) == primary) {
                                 // TP head split: A keeps the first half of
                                 // the qk and v heads, B the second. The
                                 // delta-rule state is head-local, so each
@@ -3964,11 +4321,31 @@ mod real {
                                 // qkv row layout: [q key | k key | v value].
                                 let kd = (shape.ssm_k_heads * shape.ssm_state) as u64;
                                 let vd = (shape.ssm_v_heads * shape.ssm_state) as u64;
-                                let (kh, vh2) = (kd / 2, vd / 2);
+                                let kh = kd / 2;
                                 let vheads = shape.ssm_v_heads as u64;
+                                let hk = shape.ssm_k_heads as u64;
+                                let sd = shape.ssm_state as u64;
+                                let rep = vheads / hk;
+                                let khh = hk / 2;
+                                let vsel_of = |side: u64| -> Vec<(u64, u64)> {
+                                    (0..rep)
+                                        .map(|r| ((r * hk + side * khh) * sd, (r * hk + (side + 1) * khh) * sd))
+                                        .collect()
+                                };
+                                let hsel_of = |side: u64| -> Vec<(u64, u64)> {
+                                    (0..rep).map(|r| (r * hk + side * khh, r * hk + (side + 1) * khh)).collect()
+                                };
+                                let qkv_of = |side: u64, vsel: &[(u64, u64)]| -> Vec<(u64, u64)> {
+                                    let mut v = vec![
+                                        (side * kh, (side + 1) * kh),
+                                        (kd + side * kh, kd + (side + 1) * kh),
+                                    ];
+                                    v.extend(vsel.iter().map(|&(a, b)| (2 * kd + a, 2 * kd + b)));
+                                    v
+                                };
                                 let ck = shape.ssm_conv_k as usize;
                                 let ne = shape.n_embd as usize;
-                                let mk = |ranges: &[(u64, u64)], vr: (u64, u64), hr: (u64, u64), second: bool| -> Result<Qwen35Gdn> {
+                                let mk = |ranges: &[(u64, u64)], vsel: &[(u64, u64)], hsel: &[(u64, u64)]| -> Result<Qwen35Gdn> {
                                     let alpha = read_any_f32(&file, &gguf, &t("ssm_alpha.weight"))?;
                                     let beta = read_any_f32(&file, &gguf, &t("ssm_beta.weight"))?;
                                     let av = read_any_f32(&file, &gguf, &t("ssm_a"))?;
@@ -3978,32 +4355,63 @@ mod real {
                                     for &(r0, r1) in ranges {
                                         conv_sl.extend_from_slice(&convv[r0 as usize * ck..r1 as usize * ck]);
                                     }
-                                    let (h0, h1) = (hr.0 as usize, hr.1 as usize);
                                     Ok(Qwen35Gdn {
-                                        wqkv: matw_row_ranges(&file, &gguf, &t("attn_qkv.weight"), ranges)?,
-                                        wz: matw_row_ranges(&file, &gguf, &t("attn_gate.weight"), &[vr])?,
+                                        wqkv: {
+                                            let w = matw_row_ranges(&file, &gguf, &t("attn_qkv.weight"), ranges)?;
+                                            if il == 0 && std::env::var_os("PULSAR_DEBUG_L2").is_some() {
+                                                // does B's sliced weight actually hold the rows
+                                                // the ranges name? compare its v-block's first
+                                                // row against the full tensor's same row.
+                                                if let MatW::Kq(k) = &w {
+                                                    let vrow = ranges[2].0; // first v row, global
+                                                    let off = (2 * (ranges[0].1 - ranges[0].0)) * k.row_bytes;
+                                                    let mut got = vec![0u8; 16];
+                                                    k.w.read(off as usize, &mut got)?;
+                                                    let (full, frb, _q) = read_kq_bytes(&file, &gguf, &t("attn_qkv.weight"))?;
+                                                    let fo = (vrow * frb) as usize;
+                                                    eprintln!("  WSLICE il=0 rb={} vrow={} B[{:?}] full[{:?}] {}",
+                                                        k.row_bytes, vrow, &got[..8], &full[fo..fo + 8],
+                                                        if got[..] == full[fo..fo + 16] { "MATCH" } else { "DIFFER" });
+                                                }
+                                            }
+                                            w
+                                        },
+                                        wz: matw_row_ranges(&file, &gguf, &t("attn_gate.weight"), vsel)?,
                                         conv: DeviceBuf::from_f32(&conv_sl)?,
                                         ab_w: {
-                                            let mut ab = alpha[h0 * ne..h1 * ne].to_vec();
-                                            ab.extend_from_slice(&beta[h0 * ne..h1 * ne]);
+                                            let mut ab: Vec<f32> = Vec::new();
+                                            for &(h0, h1) in hsel {
+                                                ab.extend_from_slice(&alpha[h0 as usize * ne..h1 as usize * ne]);
+                                            }
+                                            for &(h0, h1) in hsel {
+                                                ab.extend_from_slice(&beta[h0 as usize * ne..h1 as usize * ne]);
+                                            }
                                             DeviceBuf::from_f32(&ab)?
                                         },
-                                        a: DeviceBuf::from_f32(&av[h0..h1])?,
-                                        dt_bias: DeviceBuf::from_f32(&dtv[h0..h1])?,
+                                        a: {
+                                            let mut v: Vec<f32> = Vec::new();
+                                            for &(h0, h1) in hsel {
+                                                v.extend_from_slice(&av[h0 as usize..h1 as usize]);
+                                            }
+                                            DeviceBuf::from_f32(&v)?
+                                        },
+                                        dt_bias: {
+                                            let mut v: Vec<f32> = Vec::new();
+                                            for &(h0, h1) in hsel {
+                                                v.extend_from_slice(&dtv[h0 as usize..h1 as usize]);
+                                            }
+                                            DeviceBuf::from_f32(&v)?
+                                        },
                                         ssm_norm: upload(&file, &gguf, &t("ssm_norm.weight"))?,
-                                        ssm_out: matw_col_half(&file, &gguf, &t("ssm_out.weight"), second)?,
+                                        ssm_out: matw_col_ranges(&file, &gguf, &t("ssm_out.weight"), vsel)?,
                                     })
                                 };
-                                let a_half = mk(
-                                    &[(0, kh), (kd, kd + kh), (2 * kd, 2 * kd + vh2)],
-                                    (0, vh2), (0, vheads / 2), false,
-                                )?;
+                                let va = vsel_of(0);
+                                let a_half = mk(&qkv_of(0, &va), &va, &hsel_of(0))?;
                                 let cur_dev = kernels::get_device();
                                 kernels::set_device(dev_b)?;
-                                *tp_gdn_stash.borrow_mut() = Some(mk(
-                                    &[(kh, kd), (kd + kh, 2 * kd), (2 * kd + vh2, 2 * kd + vd)],
-                                    (vh2, vd), (vheads / 2, vheads), true,
-                                )?);
+                                let vb = vsel_of(1);
+                                *tp_gdn_stash.borrow_mut() = Some(mk(&qkv_of(1, &vb), &vb, &hsel_of(1))?);
                                 kernels::set_device(cur_dev)?;
                                 Some(a_half)
                             } else {
@@ -4192,6 +4600,7 @@ mod real {
                 kernels::set_device(layer_dev[il as usize])?;
                 layers.push(load_layer(il, &mut attn_vram_budget, &mut no_budget)?);
                 if tp_cfg.is_some() {
+                    tp3_layers.push(tp_ffn3_stash.borrow_mut().take());
                     let f = tp_ffn_stash.borrow_mut().take();
                     let g2 = tp_gdn_stash.borrow_mut().take();
                     let at = tp_attn_stash.borrow_mut().take();
@@ -4250,7 +4659,7 @@ mod real {
                     }
                     let m = MtpLayer {
                         layer,
-                        eh_proj: upload(&file, &gguf, &nextn("eh_proj"))?,
+                        eh_proj: MatW::load(&file, &gguf, &nextn("eh_proj"))?,
                         enorm: upload(&file, &gguf, &nextn("enorm"))?,
                         hnorm: upload(&file, &gguf, &nextn("hnorm"))?,
                         head_norm: upload(&file, &gguf, &nextn("shared_head_norm"))?,
@@ -4388,6 +4797,11 @@ mod real {
                 dsv4_out,
                 dspark,
                 tp: tp_cfg.map(|(dev, half)| TpW { dev, half, layers: tp_layers, head: tp_head }),
+                tp_c: tp3_cfg.map(|(dev, _, _)| TpCW {
+                    dev,
+                    width: shape.n_ff_exp - tp_cfg.map_or(0, |(_, h)| h) - tp3_cfg.map_or(0, |(_, _, wb)| wb),
+                    ffn: tp3_layers,
+                }),
             })
         }
     }
@@ -4673,7 +5087,9 @@ mod real {
         pub skip_logit_read: bool,
         /// Gqa KV storage format (kvq). 0=f32 (exact, default), 1=fp8
         /// e4m3 + per-row scale, 2=fp16, 3=int8 + per-row scale, 4=q8_0,
-        /// 5=q4_0. All lossy formats opt-in via PULSAR_KV=<fmt>; the
+        /// 5=q4_0, 6=turbo3, 7=turbo2, 8=turbo3_tcq, 9=turbo2_tcq,
+        /// 10=turbo1_tcq. Codes 6-10 are dsv4-only (rotated centroids /
+        /// trellis). All lossy formats opt-in via PULSAR_KV=<fmt>; the
         /// default f32 path keeps bit-exact guarantees. Dsv4's fused
         /// latent rows (raw ring + compressed) ride the same kvq field as
         /// a single flat head.
@@ -4748,6 +5164,7 @@ mod real {
         mtp_e: DeviceBuf,
         mtp_h: DeviceBuf,
         mtp_x: DeviceBuf,
+        mtp_xq: DeviceBuf,
         mtp_hidden: DeviceBuf,
         /// true-hidden anchor saved across a draft chain (the chain
         /// self-feeds approximate hiddens into mtp_hidden; the batched
@@ -5092,6 +5509,11 @@ mod real {
                     (3, _) => "int8",
                     (4, _) => if self.kvq_rot { "turbo8" } else { "q8_0" },
                     (5, _) => if self.kvq_rot { "turbo4" } else { "q4_0" },
+                    (6, _) => "turbo3",
+                    (7, _) => "turbo2",
+                    (8, _) => "turbo3_tcq",
+                    (9, _) => "turbo2_tcq",
+                    (10, _) => "turbo1_tcq",
                     _ => "f32",
                 },
                 kv_compact: self.kvq != 0 || self.kvq_lat != 0,
@@ -5373,12 +5795,15 @@ mod real {
             //   int8 -> int8 + per-row scale(stride head_dim+4,  ~4.0x)
             //   q8_0 -> 32-wide blocks f16 d + 32 i8 (stride head_dim/32*34)
             //   q4_0 -> 32-wide blocks f16 d + 16 nibbles (stride head_dim/32*18)
+            //   turbo3/turbo2 / *_tcq -> dsv4-only sub-4-bit rotated centroids
             // MLA keeps its compact latent cache as-is.
             // turbo<4|8> / rotq<4|8> = q4_0/q8_0 with a fixed orthogonal
             // rotation folded into K (pre-append) and Q (pre-attention).
             // Rotation spreads per-32-block outliers across the block so no
             // single lane dominates blockmax `d` — see TurboQuant. Decode-
             // invariant: (Q@Πᵀ)·(K@Πᵀ)ᵀ = Q@Kᵀ since ΠᵀΠ=I. V is untouched.
+            // turbo3/2 + tcq force rotation too: Π is the codec's own
+            // block-diagonal FWHT, not the MGS matrix used by turbo4/8.
             //
             // qwen35-dense (n_expert==1) runs the dense-split path, which does
             // not support the quantized KV layout - applying it deadlocked the
@@ -5391,8 +5816,14 @@ mod real {
             // kv heads), so the deadlock cause is absent and quantized KV
             // is what makes long contexts fit: f32 costs 64KB/pos/card on
             // Qwen3.8-27B, fp8 ~16KB.
-            let kv_dense =
-                s.family == Family::Qwen35 && s.n_expert == 1 && m.tp.is_none();
+            // The deadlock this guards against was diagnosed before the
+            // multi-bank rewrite. PULSAR_KV_DENSE=1 lifts it for testing:
+            // fp8 KV is worth 4x the attention bandwidth (which prefill is
+            // still bound by) and 4x the context ceiling.
+            let kv_dense = s.family == Family::Qwen35
+                && s.n_expert == 1
+                && m.tp.is_none()
+                && std::env::var("PULSAR_KV_DENSE").is_err();
             // Exhaustive: whether a family can honor PULSAR_KV is a property
             // of its cache layout, and the wrong answer here is not a slow
             // path but a hang (see the qwen35-dense note above). A new family
@@ -5478,6 +5909,15 @@ mod real {
                     Some("q4_0") | Some("q4") => (5, false),
                     Some("turbo8") | Some("rotq8") | Some("turboq8") => (4, true),
                     Some("turbo4") | Some("rotq4") | Some("turboq4") => (5, true),
+                    // buun turbo2/3 + trellis variants: intrinsically rotated
+                    // (the encoder quantizes FWHT-rotated 128-groups), so all
+                    // five force rotation on — Π is the codec's own R, see the
+                    // pi build below.
+                    Some("turbo3") => (6, true),
+                    Some("turbo2") => (7, true),
+                    Some("turbo3_tcq") => (8, true),
+                    Some("turbo2_tcq") => (9, true),
+                    Some("turbo1_tcq") => (10, true),
                     None
                         // A too-big f32 KV never OOMs on a streaming model -
                         // it silently eats the expert cache instead (measured:
@@ -5506,7 +5946,17 @@ mod real {
                 // the guard keeps it from breaking silently if that changes.
                 // Dsv4's q reads as [n_head][head_dim] (no qrot/qk_low split),
                 // so it deliberately skips this guard and keeps rotation.
-                if rot && s.qk_dim() > s.head_dim && matches!(s.family, Family::Gqa | Family::Qwen35) {
+                // codes 6-10 (turbo2/3 + trellis) have encode arms only in
+                // the dsv4 store/comp paths; the GQA append switch would
+                // fall through to a plain f32 append and overflow the
+                // smaller rows, so they are dsv4-only.
+                if q >= 6 && s.family != Family::Dsv4 {
+                    eprintln!(
+                        "pulsar: PULSAR_KV={} ignored - turbo2/turbo3 and the tcq codecs are dsv4-only; using f32 KV",
+                        kv_req.as_deref().unwrap_or(""),
+                    );
+                    (0, false)
+                } else if rot && s.qk_dim() > s.head_dim && matches!(s.family, Family::Gqa | Family::Qwen35) {
                     eprintln!(
                         "pulsar: PULSAR_KV={} rotation disabled - qk_dim {} exceeds head_dim {} (split-rope q stride); falling back to plain block-KV",
                         kv_req.as_deref().unwrap_or(""),
@@ -5553,6 +6003,15 @@ mod real {
                 2 => hd * 2,          // pure fp16
                 4 => (hd / 32) * 34,  // q8_0: 34 B / 32 elems
                 5 => (hd / 32) * 18,  // q4_0: 18 B / 32 elems
+                // buun turbo blocks: f16 norm + packed codes, 4 sub-blocks
+                // per 128-group sharing the corrected group norm
+                6 => (hd / 32) * 14,  // turbo3: 2+8+4 B / 32 elems
+                7 => (hd / 32) * 10,  // turbo2: 2+8 B / 32 elems
+                // trellis: f16 norm + 6/6/7 init bits + 128 symbols of 3/2/1
+                // bits, one packed qs per 128-group
+                8 => (hd / 128) * 52, // turbo3_tcq: 3+49 B / 128 elems
+                9 => (hd / 128) * 36, // turbo2_tcq: 2+33 B / 128 elems
+                10 => (hd / 128) * 20, // turbo1_tcq: 2+17 B / 128 elems
                 _ => hd * 4,
             };
             // fp8 latent rows carry one f32 scale at the tail, mirroring
@@ -5623,7 +6082,12 @@ mod real {
                     2 => "fp16",
                     3 => "int8",
                     4 => if kvq_rot { "turbo8" } else { "q8_0" },
-                    _ => if kvq_rot { "turbo4" } else { "q4_0" },
+                    5 => if kvq_rot { "turbo4" } else { "q4_0" },
+                    6 => "turbo3",
+                    7 => "turbo2",
+                    8 => "turbo3_tcq",
+                    9 => "turbo2_tcq",
+                    _ => "turbo1_tcq",
                 };
                 // Dsv4's full is already ring+comp across all layers (its
                 // kcache=raw ring, vcache=compressed rows are distinct data,
@@ -5639,13 +6103,22 @@ mod real {
                     packed as f64 / GIB,
                     s.n_exec_layer,
                 );
-                // q8_0/q4_0 kernels require 32-wide blocks; a non-multiple head_dim
-                // makes the append guard return 0 silently (cache stays uninitialized).
+                // q8_0/q4_0/turbo2/turbo3 kernels require 32-wide sub-blocks
+                // and the trellis codecs 128-wide groups; a non-multiple
+                // head_dim makes the append guard return 0 silently (cache
+                // stays uninitialized).
                 if matches!(kvq, 4 | 5) {
                     eprintln!(
                         "pulsar: block-KV head_dim={} ({}divisible by 32)",
                         s.head_dim,
                         if s.head_dim.is_multiple_of(32) { "" } else { "NOT " }
+                    );
+                }
+                if matches!(kvq, 6..=10) {
+                    eprintln!(
+                        "pulsar: block-KV head_dim={} ({}divisible by 128)",
+                        s.head_dim,
+                        if s.head_dim.is_multiple_of(128) { "" } else { "NOT " }
                     );
                 }
                 if kvq_rot {
@@ -5696,7 +6169,11 @@ mod real {
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok())
                 .unwrap_or(256)
-                .max(1);
+                .max(1)
+                // the qwen35 prefill chunk rides State's generic scratch
+                // (cur/normed/xq/ffn set), so a wider PULSAR_PREFILL_CHUNK
+                // lifts the batch floor with it
+                .max(qwen35::chunk_max() as u32);
 
             // everything the attn segment touches lives on the attn GPU
             // when one is set: KV, MLA scratch, q/heads, hop buffers
@@ -5905,45 +6382,121 @@ mod real {
             let pi = if kvq_rot {
                 let hd = s.head_dim as usize;
                 let n = hd * hd;
-                let mut g = 0x9E3779B97F4A7C15u64;
-                let mut rng = || {
-                    // xorshift64 on the fixed seed — only need a spread of
-                    // directions; orthogonality comes from MGS, not the RNG.
-                    g ^= g << 13;
-                    g ^= g >> 7;
-                    g ^= g << 17;
-                    ((g % 1_000_000) as f64 / 1_000_000.0 - 0.5) * 2.0
-                };
                 let mut m = vec![0.0f32; n];
-                for i in 0..hd {
-                    for j in 0..hd {
-                        m[i * hd + j] = rng() as f32;
-                    }
-                }
-                // Modified Gram-Schmidt: orthonormalize rows in place.
-                for i in 0..hd {
-                    let (si, ei) = (i * hd, (i + 1) * hd);
-                    for k in 0..i {
-                        let (sk, ek) = (k * hd, (k + 1) * hd);
-                        let dot = m[si..ei]
-                            .iter()
-                            .zip(&m[sk..ek])
-                            .map(|(a, b)| a * b)
-                            .sum::<f32>();
-                        for j in 0..hd {
-                            m[si + j] -= dot * m[sk + j];
+                if kvq >= 6 {
+                    // turbo3/turbo2 and the tcq trellis codecs are
+                    // intrinsically rotated: their CUDA encoders quantize
+                    // FWHT-rotated 128-groups and the decode codebooks live
+                    // in rotated space, so Π must be the codec's own
+                    // R = diag(s2)·FWHT₁₂₈·diag(s1)/√128 (buun seed-42 sign
+                    // tables, transcribed verbatim), block-diagonal per
+                    // 128-group. Built by pushing each unit vector through
+                    // the same xor-butterfly the reference kernel runs, so
+                    // there is no closed-form Hadamard indexing to get
+                    // wrong. R is orthogonal by construction; the shared
+                    // verify below still catches f32 drift.
+                    const WHT_SIGNS1: [f32; 128] = [
+                        -1.0, 1.0, 1.0, -1.0, -1.0, 1.0, -1.0, 1.0,
+                        -1.0, -1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+                        1.0, -1.0, 1.0, -1.0, 1.0, -1.0, -1.0, 1.0,
+                        1.0, 1.0, -1.0, 1.0, 1.0, -1.0, -1.0, -1.0,
+                        -1.0, 1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0,
+                        -1.0, 1.0, 1.0, -1.0, -1.0, 1.0, -1.0, 1.0,
+                        1.0, 1.0, 1.0, -1.0, -1.0, -1.0, -1.0, -1.0,
+                        1.0, -1.0, 1.0, 1.0, 1.0, 1.0, -1.0, 1.0,
+                        -1.0, -1.0, 1.0, -1.0, -1.0, -1.0, 1.0, -1.0,
+                        -1.0, -1.0, 1.0, -1.0, -1.0, -1.0, 1.0, 1.0,
+                        1.0, -1.0, -1.0, 1.0, 1.0, 1.0, -1.0, -1.0,
+                        1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0, -1.0,
+                        -1.0, 1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0,
+                        1.0, 1.0, 1.0, 1.0, -1.0, 1.0, -1.0, 1.0,
+                        1.0, -1.0, 1.0, 1.0, -1.0, -1.0, -1.0, -1.0,
+                        -1.0, 1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0,
+                    ];
+                    const WHT_SIGNS2: [f32; 128] = [
+                        1.0, 1.0, 1.0, 1.0, -1.0, 1.0, 1.0, -1.0,
+                        1.0, -1.0, -1.0, -1.0, 1.0, -1.0, -1.0, -1.0,
+                        1.0, 1.0, -1.0, -1.0, 1.0, -1.0, 1.0, -1.0,
+                        1.0, -1.0, -1.0, 1.0, -1.0, 1.0, 1.0, 1.0,
+                        1.0, 1.0, -1.0, -1.0, -1.0, 1.0, -1.0, -1.0,
+                        -1.0, -1.0, -1.0, -1.0, 1.0, 1.0, 1.0, -1.0,
+                        1.0, -1.0, 1.0, 1.0, 1.0, -1.0, -1.0, 1.0,
+                        -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, 1.0, 1.0,
+                        1.0, -1.0, 1.0, -1.0, -1.0, -1.0, -1.0, 1.0,
+                        -1.0, 1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0,
+                        -1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0, -1.0,
+                        -1.0, -1.0, -1.0, 1.0, -1.0, -1.0, 1.0, -1.0,
+                        1.0, -1.0, 1.0, 1.0, 1.0, -1.0, -1.0, 1.0,
+                        -1.0, 1.0, -1.0, 1.0, 1.0, -1.0, -1.0, 1.0,
+                        -1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0, -1.0,
+                        1.0, -1.0, -1.0, -1.0, -1.0, -1.0, 1.0, -1.0,
+                    ];
+                    for blk in 0..hd / 128 {
+                        let o = blk * 128;
+                        for col in 0..128usize {
+                            let mut x = [0.0f32; 128];
+                            x[col] = WHT_SIGNS1[col];
+                            // xor-mask butterfly h=1,2,…,64 — the same
+                            // pairing as the reference kernel's shuffle
+                            // butterflies, each {j, j^h} pair once.
+                            let mut h = 1usize;
+                            while h < 128 {
+                                for j in 0..128 {
+                                    let k = j ^ h;
+                                    if k > j {
+                                        let (a, b) = (x[j], x[k]);
+                                        x[j] = a + b;
+                                        x[k] = a - b;
+                                    }
+                                }
+                                h <<= 1;
+                            }
+                            for j in 0..128 {
+                                m[(o + j) * hd + (o + col)] =
+                                    WHT_SIGNS2[j] * x[j] * 0.08838834764831845f32;
+                            }
                         }
                     }
-                    let norm = m[si..ei].iter().map(|x| x * x).sum::<f32>().sqrt();
-                    if norm < 1e-6 {
-                        // Degenerate (vanishingly unlikely at f32 from a fixed
-                        // seed); nudge row i to e_i to keep Π invertible.
+                } else {
+                    let mut g = 0x9E3779B97F4A7C15u64;
+                    let mut rng = || {
+                        // xorshift64 on the fixed seed — only need a spread of
+                        // directions; orthogonality comes from MGS, not the RNG.
+                        g ^= g << 13;
+                        g ^= g >> 7;
+                        g ^= g << 17;
+                        ((g % 1_000_000) as f64 / 1_000_000.0 - 0.5) * 2.0
+                    };
+                    for i in 0..hd {
                         for j in 0..hd {
-                            m[si + j] = if j == i { 1.0 } else { 0.0 };
+                            m[i * hd + j] = rng() as f32;
                         }
-                    } else {
-                        for j in 0..hd {
-                            m[si + j] /= norm;
+                    }
+                    // Modified Gram-Schmidt: orthonormalize rows in place.
+                    for i in 0..hd {
+                        let (si, ei) = (i * hd, (i + 1) * hd);
+                        for k in 0..i {
+                            let (sk, ek) = (k * hd, (k + 1) * hd);
+                            let dot = m[si..ei]
+                                .iter()
+                                .zip(&m[sk..ek])
+                                .map(|(a, b)| a * b)
+                                .sum::<f32>();
+                            for j in 0..hd {
+                                m[si + j] -= dot * m[sk + j];
+                            }
+                        }
+                        let norm = m[si..ei].iter().map(|x| x * x).sum::<f32>().sqrt();
+                        if norm < 1e-6 {
+                            // Degenerate (vanishingly unlikely at f32 from a fixed
+                            // seed); nudge row i to e_i to keep Π invertible.
+                            for j in 0..hd {
+                                m[si + j] = if j == i { 1.0 } else { 0.0 };
+                            }
+                        } else {
+                            for j in 0..hd {
+                                m[si + j] /= norm;
+                            }
                         }
                     }
                 }
@@ -6140,6 +6693,13 @@ mod real {
                 mtp_e: f32s(if m.mtp.is_some() { mb * s.n_embd } else { 1 })?,
                 mtp_h: f32s(if m.mtp.is_some() { mb * s.n_embd } else { 1 })?,
                 mtp_x: f32s(if m.mtp.is_some() { mb * 2 * s.n_embd } else { 1 })?,
+                // q8_K activations for a native-quant eh_proj
+                mtp_xq: DeviceBuf::alloc(if m.mtp.is_some() {
+                    (mb * 2 * s.n_embd) as usize / kernels::Q8_K_BLOCK_ELEMS
+                        * kernels::Q8_K_BLOCK_BYTES
+                } else {
+                    1
+                })?,
                 mtp_hidden: {
                     let mut b = f32s(if m.mtp.is_some() { s.n_embd } else { 1 })?;
                     // read before first write (position 0 has no prior
@@ -8182,7 +8742,13 @@ mod real {
                 kernels::copy_d2d(&mut st.mtp_x, i * 2 * row, &st.mtp_e, i * row, row)?;
                 kernels::copy_d2d(&mut st.mtp_x, i * 2 * row + row, &st.mtp_h, i * row, row)?;
             }
-            kernels::matmul_q8_0(&mut st.cur, &mtp.eh_proj, &st.mtp_x, 2 * s.n_embd, s.n_embd, n_tok)?;
+            match &mtp.eh_proj {
+                MatW::Q8(b) => kernels::matmul_q8_0(&mut st.cur, b, &st.mtp_x, 2 * s.n_embd, s.n_embd, n_tok)?,
+                MatW::Kq(k) => {
+                    kernels::quantize_q8_k(&mut st.mtp_xq, &st.mtp_x, 2 * s.n_embd, n_tok)?;
+                    kernels::matmul_kq(&mut st.cur, &k.w, &st.mtp_xq, 2 * s.n_embd, s.n_embd, n_tok, k.row_bytes, k.quant)?
+                }
+            }
             self.mtp_eval_layer(st, n_tok, pos0, primary)
         }
 
@@ -8245,7 +8811,13 @@ mod real {
             kernels::rms_norm(&mut st.mtp_h, &st.mtp_hidden, &mtp.hnorm, s.n_embd, 1, s.rms_eps)?;
             kernels::copy_d2d(&mut st.mtp_x, 0, &st.mtp_e, 0, row)?;
             kernels::copy_d2d(&mut st.mtp_x, row, &st.mtp_h, 0, row)?;
-            kernels::matmul_q8_0(&mut st.cur, &mtp.eh_proj, &st.mtp_x, 2 * s.n_embd, s.n_embd, 1)?;
+            match &mtp.eh_proj {
+                MatW::Q8(b) => kernels::matmul_q8_0(&mut st.cur, b, &st.mtp_x, 2 * s.n_embd, s.n_embd, 1)?,
+                MatW::Kq(k) => {
+                    kernels::quantize_q8_k(&mut st.mtp_xq, &st.mtp_x, 2 * s.n_embd, 1)?;
+                    kernels::matmul_kq(&mut st.cur, &k.w, &st.mtp_xq, 2 * s.n_embd, s.n_embd, 1, k.row_bytes, k.quant)?
+                }
+            }
             self.mtp_eval_layer(st, 1, pos, primary)
         }
     }
@@ -8290,12 +8862,19 @@ mod real {
         let spec = model.mtp.is_some() && sampler.is_greedy();
         let mut pos = pos0;
         let mut logits = None;
-        // qwen35 MTP prefill: the draft-layer scratch is 16-row and the
-        // qwen35 forward leaves only its LAST 16-row chunk in st.cur, so
-        // the fill pass needs outer chunks capped to match (the forward
-        // is internally 16-chunked anyway - same work either way)
+        // qwen35 MTP prefill: the forward leaves only its LAST internal
+        // chunk in st.cur and the fill pass reads every row of the chunk
+        // back, so the outer chunks are capped to the forward's own width.
+        //
+        // This used to be hardcoded to 16 with the note that the forward
+        // was internally 16-chunked anyway - same work either way.
+        // That stopped being true when the internal width grew to 128:
+        // 16-row outer chunks swept the whole 15.7GB of weights 8x more
+        // often than needed, and the MTP prefill path was 5.4x slower
+        // than the same prompt with MTP off (61s vs 11s on 7120 tokens).
+        // The MTP scratch is max_batch-sized, so it was never the limit.
         let chunk_cap = if spec && model.shape.family == Family::Qwen35 {
-            16
+            (st.max_batch() as usize).min(qwen35::chunk_max())
         } else {
             st.max_batch() as usize
         };
