@@ -99,6 +99,8 @@ mod real {
         fn pulsar_rms_norm(out: *mut c_void, x: *const c_void, w: *const c_void, n: u32, rows: u32, eps: f32) -> i32;
         fn pulsar_q8_0_matmul(out: *mut c_void, w: *const c_void, x: *const c_void, in_dim: u32, out_dim: u32, n_tok: u32) -> i32;
         fn pulsar_preq_scratch_reserve(bytes: u64) -> i32;
+        fn pulsar_set_lane(lane: i32);
+        fn pulsar_lane_prewarm();
         fn pulsar_q8_0_matmul_banked(out: *mut c_void, w: *const c_void, x: *const c_void, in_dim: u32, out_dim: u32, n_bank: u32, n_tok: u32) -> i32;
         fn pulsar_matmul_f32(out: *mut c_void, w: *const c_void, x: *const c_void, in_dim: u32, out_dim: u32, n_tok: u32) -> i32;
         fn pulsar_matmul_kq(out: *mut c_void, w: *const c_void, xq: *const c_void, in_dim: u32, out_dim: u32, n_tok: u32, row_bytes: u64, quant: u32) -> i32;
@@ -168,6 +170,13 @@ mod real {
         #[allow(clippy::too_many_arguments)]
         fn pulsar_rope_yarn_partial(x: *mut c_void, n_tok: u32, n_head: u32, head_dim: u32, rot_dim: u32, pos0: u32, freq_base: f32, freq_scale: f32, ext_factor: f32, attn_factor: f32, beta_fast: f32, beta_slow: f32, n_ctx_orig: u32) -> i32;
         fn pulsar_qwen35_conv_batch(out: *mut c_void, x: *const c_void, kern: *const c_void, state: *mut c_void, n_chan: u32, k: u32, n_tok: u32) -> i32;
+    fn pulsar_q4e_hc_norm(y: *mut c_void, x: *const c_void, gamma: *const c_void, n_embd: u32, n_hc: u32, rows: u32, eps: f32) -> i32;
+    fn pulsar_q4e_hc_collapse(mixed: *mut c_void, xn: *const c_void, gl: *const c_void, n_embd: u32, n_hc: u32, rows: u32) -> i32;
+    fn pulsar_q4e_stream_scatter(res: *mut c_void, out: *const c_void, coef: *const c_void, n_embd: u32, n_hc: u32, rows: u32, mode: u32) -> i32;
+    fn pulsar_q4e_replicate(res: *mut c_void, emb: *const c_void, n_embd: u32, n_hc: u32, rows: u32) -> i32;
+    fn pulsar_q4e_silu_scale(x: *mut c_void, scale: f32, n: u64) -> i32;
+    fn pulsar_q4e_ple_gate(coef: *mut c_void, keyn: *const c_void, queryn: *const c_void, n_embd: u32, n_hc: u32, rows: u32) -> i32;
+    fn pulsar_q4e_conv_dil(out: *mut c_void, x: *const c_void, kern: *const c_void, state: *mut c_void, n_chan: u32, k: u32, dil: u32, n_tok: u32) -> i32;
         fn pulsar_qwen35_gdn_batch(out: *mut c_void, state: *mut c_void, q: *const c_void, k: *const c_void, v: *const c_void, g: *const c_void, beta: *const c_void, h_v: u32, h_k: u32, dim: u32, n_tok: u32) -> i32;
         fn pulsar_qwen35_row_scale(x: *mut c_void, s: *const c_void, n_rows: u32, dim: u32) -> i32;
         fn pulsar_qwen35_draft_attn(out: *mut c_void, q: *const c_void, k: *const c_void, v: *const c_void, n_q: u32, n_kv: u32, n_head: u32, n_kv_head: u32, dim: u32, scale: f32) -> i32;
@@ -285,6 +294,7 @@ mod real {
     /// The primary (stream) device ensure_device picked; get_device()
     /// drifts with per-layer set_device calls, this does not.
     static PRIMARY_DEV: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+    static PRIMARY_H2D_BITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     /// The measured-best primary device chosen at startup. Unlike
     /// get_device() this is stable across the engine's per-layer device
@@ -293,6 +303,37 @@ mod real {
     pub fn primary_device() -> i32 {
         ensure_device();
         PRIMARY_DEV.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Pinned 64MB H2D probe of the primary stream device, GB/s. Zero until
+    /// `ensure_device` has run. Used by q* so the miss split matches the
+    /// link that was actually measured, not a spec-sheet default.
+    pub fn primary_h2d_gbs() -> f64 {
+        ensure_device();
+        f64::from_bits(PRIMARY_H2D_BITS.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Default-ON env flag: unset or any value but "0" means on. Both TP
+    /// hop levers (PULSAR_P2P, PULSAR_TP_BF16) measured strictly faster
+    /// (11.15 -> 10.12s on the 7.4k TP prefill) and p2p self-detects
+    /// driver support, so opt-OUT is the safe polarity.
+    fn env_on(name: &str) -> bool {
+        std::env::var(name).map_or(true, |v| v != "0")
+    }
+
+    /// P2P's effective default: ON, EXCEPT when the two-lane prefill
+    /// pipe is armed. The patched consumer-P2P kernel module faults
+    /// (libcuda SIGSEGV in cuStreamWaitEvent) when replayed decode
+    /// graphs carrying peer copies mix with the pipe's event/alloc
+    /// churn - the repro needs p2p+bf16+graphs+MTP+growing prompts
+    /// together (2026-08-23). Under the pipe p2p measured ZERO prefill
+    /// win (hops hide behind the other lane), so off is free. An
+    /// explicit PULSAR_P2P=1 still forces it on.
+    fn p2p_on() -> bool {
+        match std::env::var("PULSAR_P2P") {
+            Ok(v) => v != "0",
+            Err(_) => std::env::var("PULSAR_PIPE").ok().as_deref() != Some("1"),
+        }
     }
 
     fn ensure_device() {
@@ -327,14 +368,16 @@ mod real {
                 best.0
             });
             PRIMARY_DEV.store(dev, std::sync::atomic::Ordering::Relaxed);
-            // PULSAR_P2P=1: establish peer access HERE, inside the same
+            // P2P defaults ON (PULSAR_P2P=0 disables), and the peer access must
+            // be established HERE, inside the same
+
             // once-block that picks the device, i.e. before a single
             // DeviceBuf exists. Enabling it later (from TpLink::new, after
             // the weight pool is allocated) surfaced as a failing kernel
             // launch two calls downstream, which is what a deferred CUDA
             // error looks like. Consumer cards report can-access only with
             // a patched driver; where they do not, this is a no-op.
-            if std::env::var_os("PULSAR_P2P").is_some() {
+            if p2p_on() {
                 let mut n = 0;
                 unsafe { cudaGetDeviceCount(&mut n) };
                 let mut pairs = 0;
@@ -848,7 +891,8 @@ mod real {
         s16: DeviceBuf,
         /// bf16 stage on the RECEIVER's device (unpack source)
         r16: DeviceBuf,
-        /// PULSAR_TP_BF16=1: halve the bytes that cross the bus
+        /// bf16 hop staging, on by default (PULSAR_TP_BF16=0 for exact
+        /// f32 hops): halves the bytes that cross the bus
         bf16: bool,
     }
 
@@ -870,11 +914,11 @@ mod real {
             set_device(peer)?;
             let r16 = DeviceBuf::alloc(bytes / 2 + 4)?;
             set_device(here)?;
-            let bf16 = std::env::var_os("PULSAR_TP_BF16").is_some();
+            let bf16 = env_on("PULSAR_TP_BF16");
             // Peer access itself is established once in ensure_device, before
             // any allocation; here we only ASK whether it took, both ways.
             let mut p2p = false;
-            if std::env::var_os("PULSAR_P2P").is_some() && here != peer {
+            if p2p_on() && here != peer {
                 let (mut ab, mut ba) = (0i32, 0i32);
                 unsafe {
                     cudaDeviceCanAccessPeer(&mut ab, here, peer);
@@ -1228,6 +1272,21 @@ mod real {
     /// Pre-allocate the q8_0 prequant scratch on the CURRENT device so a
     /// later matmul_q8_0 inside a CUDA-graph capture hits the cached
     /// pointer: cudaMalloc is illegal mid-capture.
+    /// Selects this HOST THREAD's scratch-arena lane (0 or 1) for the
+    /// process-global preq/octet/nvfp4-act/gqa-split arenas. The
+    /// PULSAR_PIPE prefill sets 1 on its second worker thread so the two
+    /// lanes never share a staging buffer mid-flight.
+    pub fn set_lane(lane: u32) {
+        unsafe { pulsar_set_lane(lane as i32) }
+    }
+
+    /// Allocates the current thread-lane's scratch arenas on the CURRENT
+    /// device at their floors (first-use cudaMalloc stalls move out of
+    /// the timed prefill). Call once per (device, lane).
+    pub fn lane_prewarm() {
+        unsafe { pulsar_lane_prewarm() }
+    }
+
     pub fn preq_scratch_reserve(bytes: u64) -> Result {
         check(unsafe { pulsar_preq_scratch_reserve(bytes) }, "preq_scratch_reserve")
     }
@@ -1726,6 +1785,28 @@ mod real {
     /// Batched conv+silu: n_tok tokens sequentially in one launch.
     pub fn qwen35_conv_batch(out: &mut DeviceBuf, x: &DeviceBuf, kern: &DeviceBuf, state: &mut DeviceBuf, n_chan: u32, k: u32, n_tok: u32) -> Result {
         check(unsafe { pulsar_qwen35_conv_batch(out.ptr_mut(), x.ptr(), kern.ptr(), state.ptr_mut(), n_chan, k, n_tok) }, "qwen35_conv_batch")
+    }
+
+    pub fn q4e_hc_norm(y: &mut DeviceBuf, x: &DeviceBuf, gamma: &DeviceBuf, n_embd: u32, n_hc: u32, rows: u32, eps: f32) -> Result {
+        check(unsafe { pulsar_q4e_hc_norm(y.ptr_mut(), x.ptr(), gamma.ptr(), n_embd, n_hc, rows, eps) }, "q4e_hc_norm")
+    }
+    pub fn q4e_hc_collapse(mixed: &mut DeviceBuf, xn: &DeviceBuf, gl: &DeviceBuf, n_embd: u32, n_hc: u32, rows: u32) -> Result {
+        check(unsafe { pulsar_q4e_hc_collapse(mixed.ptr_mut(), xn.ptr(), gl.ptr(), n_embd, n_hc, rows) }, "q4e_hc_collapse")
+    }
+    pub fn q4e_stream_scatter(res: &mut DeviceBuf, out: &DeviceBuf, coef: &DeviceBuf, n_embd: u32, n_hc: u32, rows: u32, mode: u32) -> Result {
+        check(unsafe { pulsar_q4e_stream_scatter(res.ptr_mut(), out.ptr(), coef.ptr(), n_embd, n_hc, rows, mode) }, "q4e_stream_scatter")
+    }
+    pub fn q4e_replicate(res: &mut DeviceBuf, emb: &DeviceBuf, n_embd: u32, n_hc: u32, rows: u32) -> Result {
+        check(unsafe { pulsar_q4e_replicate(res.ptr_mut(), emb.ptr(), n_embd, n_hc, rows) }, "q4e_replicate")
+    }
+    pub fn q4e_silu_scale(x: &mut DeviceBuf, scale: f32, n: u64) -> Result {
+        check(unsafe { pulsar_q4e_silu_scale(x.ptr_mut(), scale, n) }, "q4e_silu_scale")
+    }
+    pub fn q4e_ple_gate(coef: &mut DeviceBuf, keyn: &DeviceBuf, queryn: &DeviceBuf, n_embd: u32, n_hc: u32, rows: u32) -> Result {
+        check(unsafe { pulsar_q4e_ple_gate(coef.ptr_mut(), keyn.ptr(), queryn.ptr(), n_embd, n_hc, rows) }, "q4e_ple_gate")
+    }
+    pub fn q4e_conv_dil(out: &mut DeviceBuf, x: &DeviceBuf, kern: &DeviceBuf, state: &mut DeviceBuf, n_chan: u32, k: u32, dil: u32, n_tok: u32) -> Result {
+        check(unsafe { pulsar_q4e_conv_dil(out.ptr_mut(), x.ptr(), kern.ptr(), state.ptr_mut(), n_chan, k, dil, n_tok) }, "q4e_conv_dil")
     }
 
     /// Batched GDN delta rule: state columns ride registers across n_tok
